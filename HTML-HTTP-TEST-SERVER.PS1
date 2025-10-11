@@ -219,7 +219,6 @@ function Add-NewConfig {
 
 function Update-GUIFromConfig {
     if ($Script:ServerConfigs.Count -gt $Script:CurrentConfigIndex -and $Form.IsHandleCreated) {
-        $config = $Script:ServerConfigs[$Script:CurrentConfigIndex]
         $Form.Invoke([System.Action] {
             $configParam = $Script:ServerConfigs[$Script:CurrentConfigIndex]
             # Update common controls
@@ -244,9 +243,8 @@ function Update-GUIFromConfig {
             $SingleFileTextBox.Visible = -not $isRootMode
             $SingleFileBrowseButton.Visible = -not $isRootMode
 
-            # Update form text and header
-            $Form.Text = "EliteSoftware HTTP Test Server - $($configParam.Name)"
-            $HeaderLabel.Text = "HTTP Server: $($configParam.Name)"
+            # Update form text to show current server
+            $Form.Text = "EliteSoftware HTML-HTTP Test Server - $($configParam.Name)"
 
             $SidebarList.SelectedIndex = $Script:CurrentConfigIndex
             Update-ServerButtons $configParam.Status # Update buttons based on the config's status
@@ -991,7 +989,7 @@ $AppIcon = Get-AppIcon
 
 # Create the main form
 $Form = [System.Windows.Forms.Form]::new()
-$Form.Text = "EliteSoftware HTTP Test Server"
+$Form.Text = "EliteSoftware HTML-HTTP Test Server"
 $Form.Size = [System.Drawing.Size]::new($FormWidth, $FormHeight)
 $Form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
 $Form.MinimizeBox = $true
@@ -1119,7 +1117,7 @@ $ContentPanel.Controls.Add($HeaderPanel)
 
 # Header Title
 $HeaderLabel = [System.Windows.Forms.Label]::new()
-$HeaderLabel.Text = "HTTP Test Server Control Panel"
+$HeaderLabel.Text = "EliteSoftware HTML-HTTP Test Server"
 $HeaderLabel.Font = [System.Drawing.Font]::new("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
 $HeaderLabel.ForeColor = [System.Drawing.Color]::White
 $HeaderLabel.AutoSize = $true
