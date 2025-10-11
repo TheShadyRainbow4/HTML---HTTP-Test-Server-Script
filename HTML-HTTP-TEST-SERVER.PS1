@@ -1,10 +1,16 @@
-# EliteSoftware HTML - HTTP Test Server v1.4.3.0 - Created by: Zachary Whiteman & Google Gemini Ai. 2025-10-11 - 03:45 EDT
+# EliteSoftware HTML - HTTP Test Server v1.5.0.0 - Created by: Zachary Whiteman & Google Gemini Ai. 2025-10-11 - 04:00 EDT
 
 <#
     This script implements a multi-server HTTP test platform GUI using PowerShell WinForms and threading.
 
-    FIXES IN V1.4.3.0:
-    - **Fixed Configuration Save Errors:** Resolved the recurring `SetValueInvocationException` by ensuring that all configuration objects loaded from JSON are converted into fully modifiable `[PSCustomObject]` types. This guarantees that properties can be updated and saved without error.
+    FIXES IN V1.5.0.0:
+    - No major bug fixes, focus on feature enhancements.
+
+    FEATURE ENHANCEMENTS IN V1.5.0.0:
+    - **Revamped Settings Window:** The settings window now features the same gradient header as the main form and uses a tabbed interface ("General" and "Advanced").
+    - **New General Setting:** Added a "Hide Console Window on Next Launch" option.
+    - **New Advanced Settings:** Added 5 advanced settings: Enable Directory Listing, Custom 404 Page, Log Request Headers, MIME Type Overrides, and Enable HTTP Keep-Alive.
+    - **UI Consistency:** The Help Guide window now also includes the gradient header for a consistent look and feel.
 #>
 
 # ==============================================================================
@@ -12,7 +18,7 @@
 # ==============================================================================
 
 # Script Versioning
-[string]$ScriptVersion = "v1.4.3.0"
+[string]$ScriptVersion = "v1.5.0.0"
 
 # Load required .NET assemblies
 # The 'Add-Type' for Drawing2D often generates a benign file-not-found error in some editors,
@@ -86,6 +92,13 @@ function Load-Settings {
         LogToFile = $false
         LogFilePath = (Join-Path -Path $configPath -ChildPath "server.log")
         ShowGoodbyeWindow = $true
+        HideConsoleOnLaunch = $false
+        # Advanced Settings
+        DirectoryListingEnabled = $false
+        Custom404PagePath = ""
+        LogRequestHeaders = $false
+        MimeTypeOverrides = "log=text/plain;config=application/xml"
+        EnableKeepAlive = $true
     }
 
     if (Test-Path $settingsFile) {
@@ -354,9 +367,25 @@ function Start-Server {
                         $status = 404
                         $response.StatusCode = 404
                         $response.StatusDescription = "Not Found"
-                        $output = [System.Text.Encoding]::UTF8.GetBytes("<html><head><title>404 Not Found</title></head><body><h1>EliteServer 404</h1><p>The requested file ($filePath) was not found in the root directory.</p></body></html>")
-                        $response.ContentLength64 = $output.Length
-                        $response.OutputStream.Write($output, 0, $output.Length)
+                        
+                        $outputBytes = $null
+                        # Check for custom 404 page
+                        if (-not [string]::IsNullOrEmpty($Script:Settings.Custom404PagePath) -and (Test-Path $Script:Settings.Custom404PagePath -PathType Leaf)) {
+                            try {
+                                $outputBytes = [System.IO.File]::ReadAllBytes($Script:Settings.Custom404PagePath)
+                                $response.ContentType = [System.Web.MimeMapping]::GetMimeMapping($Script:Settings.Custom404PagePath)
+                            } catch {
+                                $LogQueue.Enqueue("ERROR: Failed to read custom 404 page. Falling back to default. Error: $($_.Exception.Message)")
+                                $outputBytes = [System.Text.Encoding]::UTF8.GetBytes("<html><head><title>404 Not Found</title></head><body><h1>EliteServer 404</h1><p>The requested file ($filePath) was not found. Additionally, the configured custom 404 page could not be loaded.</p></body></html>")
+                                $response.ContentType = "text/html"
+                            }
+                        } else {
+                            $outputBytes = [System.Text.Encoding]::UTF8.GetBytes("<html><head><title>404 Not Found</title></head><body><h1>EliteServer 404</h1><p>The requested file ($filePath) was not found in the root directory.</p></body></html>")
+                            $response.ContentType = "text/html"
+                        }
+
+                        $response.ContentLength64 = $outputBytes.Length
+                        $response.OutputStream.Write($outputBytes, 0, $outputBytes.Length)
                     }
 
                 } catch {
@@ -369,10 +398,14 @@ function Start-Server {
                     $response.OutputStream.Close()
                 }
 
-                # Log the request using the detailed format (B)
+                # Log the request
                 $logMessage = "[$status] $($request.RemoteEndPoint.Address) - $($request.HttpMethod) /$filePath (File Size: $([Math]::Round($fileSize / 1KB, 2)) KB)"
                 $LogQueue.Enqueue($logMessage)
 
+                if ($Script:Settings.LogRequestHeaders) {
+                    $headersText = $request.Headers.ToString().Trim()
+                    $LogQueue.Enqueue("`tRequest Headers:`n$($headersText)")
+                }
 
             } catch [System.Net.HttpListenerException] {
                 # Listener stopped gracefully
@@ -555,30 +588,60 @@ function Show-GoodbyeWindow {
 function Show-SettingsWindow {
     $SettingsForm = [System.Windows.Forms.Form]::new()
     $SettingsForm.Text = "Application Settings"
-    $SettingsForm.Size = [System.Drawing.Size]::new(550, 450)
+    $SettingsForm.Size = [System.Drawing.Size]::new(600, 550) # Increased height
     $SettingsForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
     $SettingsForm.MinimizeBox = $false
     $SettingsForm.MaximizeBox = $false
     $SettingsForm.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
     $SettingsForm.BackColor = [System.Drawing.Color]::FromArgb(255, 240, 240, 240)
+    $SettingsForm.Icon = $AppIcon
 
+    # --- Header ---
+    $HeaderPanel = [System.Windows.Forms.Panel]::new()
+    $HeaderPanel.Dock = [System.Windows.Forms.DockStyle]::Top
+    $HeaderPanel.Height = 70
+    $HeaderPanel.Add_Paint({Draw-GradientHeader $HeaderPanel $_})
+    $SettingsForm.Controls.Add($HeaderPanel)
+
+    $HeaderLabel = [System.Windows.Forms.Label]::new()
+    $HeaderLabel.Text = "Settings"
+    $HeaderLabel.Font = [System.Drawing.Font]::new("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
+    $HeaderLabel.ForeColor = [System.Drawing.Color]::White
+    $HeaderLabel.AutoSize = $true
+    $HeaderLabel.Location = [System.Drawing.Point]::new(20, 20)
+    $HeaderLabel.BackColor = [System.Drawing.Color]::Transparent
+    $HeaderPanel.Controls.Add($HeaderLabel)
+
+    # --- Tab Control ---
+    $TabControl = [System.Windows.Forms.TabControl]::new()
+    $TabControl.Location = [System.Drawing.Point]::new(10, $HeaderPanel.Height + 10)
+    $TabControl.Size = [System.Drawing.Size]::new($SettingsForm.ClientSize.Width - 20, $SettingsForm.ClientSize.Height - $HeaderPanel.Height - 70)
+    $TabControl.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $SettingsForm.Controls.Add($TabControl)
+
+    $GeneralTabPage = [System.Windows.Forms.TabPage]::new("General")
+    $AdvancedTabPage = [System.Windows.Forms.TabPage]::new("Advanced")
+    $TabControl.TabPages.Add($GeneralTabPage) | Out-Null
+    $TabControl.TabPages.Add($AdvancedTabPage) | Out-Null
+
+    # =================== GENERAL SETTINGS TAB ===================
     $yPos = 20
     $xPos = 20
     $labelWidth = 200
-    $controlWidth = 280
+    $controlWidth = 320
 
     # --- Default Root ---
     $DefaultRootLabel = [System.Windows.Forms.Label]::new()
     $DefaultRootLabel.Text = "Default Root for New Servers:"
     $DefaultRootLabel.AutoSize = $true
     $DefaultRootLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
-    $SettingsForm.Controls.Add($DefaultRootLabel)
+    $GeneralTabPage.Controls.Add($DefaultRootLabel)
 
     $DefaultRootTextBox = [System.Windows.Forms.TextBox]::new()
     $DefaultRootTextBox.Text = $Script:Settings.DefaultRoot
     $DefaultRootTextBox.Width = $controlWidth
     $DefaultRootTextBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
-    $SettingsForm.Controls.Add($DefaultRootTextBox)
+    $GeneralTabPage.Controls.Add($DefaultRootTextBox)
     $yPos += 35
 
     # --- Default File ---
@@ -586,13 +649,13 @@ function Show-SettingsWindow {
     $DefaultFileLabel.Text = "Default File for New Servers:"
     $DefaultFileLabel.AutoSize = $true
     $DefaultFileLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
-    $SettingsForm.Controls.Add($DefaultFileLabel)
+    $GeneralTabPage.Controls.Add($DefaultFileLabel)
 
     $DefaultFileTextBox = [System.Windows.Forms.TextBox]::new()
     $DefaultFileTextBox.Text = $Script:Settings.DefaultFile
     $DefaultFileTextBox.Width = $controlWidth
     $DefaultFileTextBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
-    $SettingsForm.Controls.Add($DefaultFileTextBox)
+    $GeneralTabPage.Controls.Add($DefaultFileTextBox)
     $yPos += 35
 
     # --- Default Port ---
@@ -600,13 +663,13 @@ function Show-SettingsWindow {
     $DefaultPortLabel.Text = "Default Port for New Servers:"
     $DefaultPortLabel.AutoSize = $true
     $DefaultPortLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
-    $SettingsForm.Controls.Add($DefaultPortLabel)
+    $GeneralTabPage.Controls.Add($DefaultPortLabel)
 
     $DefaultPortTextBox = [System.Windows.Forms.TextBox]::new()
     $DefaultPortTextBox.Text = $Script:Settings.DefaultPort
     $DefaultPortTextBox.Width = $controlWidth
     $DefaultPortTextBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
-    $SettingsForm.Controls.Add($DefaultPortTextBox)
+    $GeneralTabPage.Controls.Add($DefaultPortTextBox)
     $yPos += 35
 
     # --- Default IP Address ---
@@ -614,7 +677,7 @@ function Show-SettingsWindow {
     $DefaultIPLabel.Text = "Default IP for New Servers:"
     $DefaultIPLabel.AutoSize = $true
     $DefaultIPLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
-    $SettingsForm.Controls.Add($DefaultIPLabel)
+    $GeneralTabPage.Controls.Add($DefaultIPLabel)
 
     $DefaultIPComboBox = [System.Windows.Forms.ComboBox]::new()
     $DefaultIPComboBox.Items.Add("127.0.0.1")
@@ -622,7 +685,7 @@ function Show-SettingsWindow {
     $DefaultIPComboBox.Text = $Script:Settings.DefaultIP
     $DefaultIPComboBox.Width = $controlWidth
     $DefaultIPComboBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
-    $SettingsForm.Controls.Add($DefaultIPComboBox)
+    $GeneralTabPage.Controls.Add($DefaultIPComboBox)
     $yPos += 35
 
     # --- Max Log Lines ---
@@ -630,13 +693,13 @@ function Show-SettingsWindow {
     $MaxLogLinesLabel.Text = "Max Log Lines in GUI:"
     $MaxLogLinesLabel.AutoSize = $true
     $MaxLogLinesLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
-    $SettingsForm.Controls.Add($MaxLogLinesLabel)
+    $GeneralTabPage.Controls.Add($MaxLogLinesLabel)
 
     $MaxLogLinesTextBox = [System.Windows.Forms.TextBox]::new()
     $MaxLogLinesTextBox.Text = $Script:Settings.MaxLogLines
     $MaxLogLinesTextBox.Width = $controlWidth
     $MaxLogLinesTextBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
-    $SettingsForm.Controls.Add($MaxLogLinesTextBox)
+    $GeneralTabPage.Controls.Add($MaxLogLinesTextBox)
     $yPos += 35
 
     # --- Log to File Checkbox ---
@@ -645,21 +708,21 @@ function Show-SettingsWindow {
     $LogToFileCheckBox.Checked = $Script:Settings.LogToFile
     $LogToFileCheckBox.AutoSize = $true
     $LogToFileCheckBox.Location = [System.Drawing.Point]::new($xPos, $yPos)
-    $SettingsForm.Controls.Add($LogToFileCheckBox)
-    $yPos += 35
+    $GeneralTabPage.Controls.Add($LogToFileCheckBox)
+    $yPos += 30
 
     # --- Log File Path ---
     $LogFilePathLabel = [System.Windows.Forms.Label]::new()
     $LogFilePathLabel.Text = "Log File Path:"
     $LogFilePathLabel.AutoSize = $true
     $LogFilePathLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
-    $SettingsForm.Controls.Add($LogFilePathLabel)
+    $GeneralTabPage.Controls.Add($LogFilePathLabel)
 
     $LogFilePathTextBox = [System.Windows.Forms.TextBox]::new()
     $LogFilePathTextBox.Text = $Script:Settings.LogFilePath
     $LogFilePathTextBox.Width = $controlWidth
     $LogFilePathTextBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
-    $SettingsForm.Controls.Add($LogFilePathTextBox)
+    $GeneralTabPage.Controls.Add($LogFilePathTextBox)
     $yPos += 35
 
     # --- Show Goodbye Window Checkbox ---
@@ -668,21 +731,110 @@ function Show-SettingsWindow {
     $ShowGoodbyeCheckBox.Checked = $Script:Settings.ShowGoodbyeWindow
     $ShowGoodbyeCheckBox.AutoSize = $true
     $ShowGoodbyeCheckBox.Location = [System.Drawing.Point]::new($xPos, $yPos)
-    $SettingsForm.Controls.Add($ShowGoodbyeCheckBox)
-    $yPos += 50
+    $GeneralTabPage.Controls.Add($ShowGoodbyeCheckBox)
+    $yPos += 30
+
+    # --- Hide Console Window Checkbox ---
+    $HideConsoleCheckBox = [System.Windows.Forms.CheckBox]::new()
+    $HideConsoleCheckBox.Text = "Hide Console Window on Next Launch"
+    $HideConsoleCheckBox.Checked = $Script:Settings.HideConsoleOnLaunch
+    $HideConsoleCheckBox.AutoSize = $true
+    $HideConsoleCheckBox.Location = [System.Drawing.Point]::new($xPos, $yPos)
+    $GeneralTabPage.Controls.Add($HideConsoleCheckBox)
+
+    # =================== ADVANCED SETTINGS TAB ===================
+    $yPos = 20 # Reset Y for new tab
+
+    # --- Enable Directory Listing ---
+    $DirListingCheckBox = [System.Windows.Forms.CheckBox]::new()
+    $DirListingCheckBox.Text = "Enable Directory Listing"
+    $DirListingCheckBox.Checked = $Script:Settings.DirectoryListingEnabled
+    $DirListingCheckBox.AutoSize = $true
+    $DirListingCheckBox.Location = [System.Drawing.Point]::new($xPos, $yPos)
+    $AdvancedTabPage.Controls.Add($DirListingCheckBox)
+    $yPos += 30
+
+    # --- Enable Keep-Alive ---
+    $KeepAliveCheckBox = [System.Windows.Forms.CheckBox]::new()
+    $KeepAliveCheckBox.Text = "Enable HTTP Keep-Alive"
+    $KeepAliveCheckBox.Checked = $Script:Settings.EnableKeepAlive
+    $KeepAliveCheckBox.AutoSize = $true
+    $KeepAliveCheckBox.Location = [System.Drawing.Point]::new($xPos, $yPos)
+    $AdvancedTabPage.Controls.Add($KeepAliveCheckBox)
+    $yPos += 30
+
+    # --- Log Request Headers ---
+    $LogHeadersCheckBox = [System.Windows.Forms.CheckBox]::new()
+    $LogHeadersCheckBox.Text = "Log Full Request Headers (Verbose)"
+    $LogHeadersCheckBox.Checked = $Script:Settings.LogRequestHeaders
+    $LogHeadersCheckBox.AutoSize = $true
+    $LogHeadersCheckBox.Location = [System.Drawing.Point]::new($xPos, $yPos)
+    $AdvancedTabPage.Controls.Add($LogHeadersCheckBox)
+    $yPos += 35
+
+    # --- Custom 404 Page ---
+    $Custom404Label = [System.Windows.Forms.Label]::new()
+    $Custom404Label.Text = "Custom 404 Error Page:"
+    $Custom404Label.AutoSize = $true
+    $Custom404Label.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
+    $AdvancedTabPage.Controls.Add($Custom404Label)
+
+    $Custom404TextBox = [System.Windows.Forms.TextBox]::new()
+    $Custom404TextBox.Text = $Script:Settings.Custom404PagePath
+    $Custom404TextBox.Width = $controlWidth - 100
+    $Custom404TextBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
+    $AdvancedTabPage.Controls.Add($Custom404TextBox)
+
+    $Custom404BrowseButton = [System.Windows.Forms.Button]::new()
+    $Custom404BrowseButton.Text = "Browse..."
+    $Custom404BrowseButton.Size = [System.Drawing.Size]::new(90, 25)
+    $Custom404BrowseButton.Location = [System.Drawing.Point]::new($Custom404TextBox.Right + 10, $yPos - 2)
+    $Custom404BrowseButton.FlatStyle = [System.Windows.Forms.FlatStyle]::System
+    $Custom404BrowseButton.Add_Click({
+        $FileBrowser = [System.Windows.Forms.OpenFileDialog]::new()
+        $FileBrowser.Filter = "HTML Files (*.html, *.htm)|*.html;*.htm|All files (*.*)|*.*"
+        if ($FileBrowser.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $Custom404TextBox.Text = $FileBrowser.FileName
+        }
+    })
+    $AdvancedTabPage.Controls.Add($Custom404BrowseButton)
+    $yPos += 35
+
+    # --- MIME Type Overrides ---
+    $MimeTypesLabel = [System.Windows.Forms.Label]::new()
+    $MimeTypesLabel.Text = "MIME Type Overrides:"
+    $MimeTypesLabel.AutoSize = $true
+    $MimeTypesLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
+    $AdvancedTabPage.Controls.Add($MimeTypesLabel)
+
+    $MimeTypesTextBox = [System.Windows.Forms.TextBox]::new()
+    $MimeTypesTextBox.Text = $Script:Settings.MimeTypeOverrides
+    $MimeTypesTextBox.Width = $controlWidth
+    $MimeTypesTextBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
+    $AdvancedTabPage.Controls.Add($MimeTypesTextBox)
+    $yPos += 35
+
+    $MimeTypesHelpLabel = [System.Windows.Forms.Label]::new()
+    $MimeTypesHelpLabel.Text = "(Format: ext=type;ext2=type2)"
+    $MimeTypesHelpLabel.AutoSize = $true
+    $MimeTypesHelpLabel.ForeColor = [System.Drawing.Color]::Gray
+    $MimeTypesHelpLabel.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
+    $AdvancedTabPage.Controls.Add($MimeTypesHelpLabel)
 
     # --- Save and Cancel Buttons ---
     $SaveButton = [System.Windows.Forms.Button]::new()
     $SaveButton.Text = "Save"
     $SaveButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
-    $SaveButton.Location = [System.Drawing.Point]::new($SettingsForm.Width - 220, $SettingsForm.Height - 80)
+    $SaveButton.Location = [System.Drawing.Point]::new($SettingsForm.ClientSize.Width - 180, $SettingsForm.ClientSize.Height - 45)
+    $SaveButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
     $SaveButton.FlatStyle = [System.Windows.Forms.FlatStyle]::System
     $SettingsForm.Controls.Add($SaveButton)
 
     $CancelButton = [System.Windows.Forms.Button]::new()
     $CancelButton.Text = "Cancel"
     $CancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    $CancelButton.Location = [System.Drawing.Point]::new($SettingsForm.Width - 130, $SettingsForm.Height - 80)
+    $CancelButton.Location = [System.Drawing.Point]::new($SettingsForm.ClientSize.Width - 95, $SettingsForm.ClientSize.Height - 45)
+    $CancelButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
     $CancelButton.FlatStyle = [System.Windows.Forms.FlatStyle]::System
     $SettingsForm.Controls.Add($CancelButton)
 
@@ -690,7 +842,7 @@ function Show-SettingsWindow {
     $SettingsForm.CancelButton = $CancelButton
 
     if ($SettingsForm.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-        # Save the settings
+        # Save General settings
         $Script:Settings.DefaultRoot = $DefaultRootTextBox.Text
         $Script:Settings.DefaultFile = $DefaultFileTextBox.Text
         $Script:Settings.DefaultPort = [int]$DefaultPortTextBox.Text
@@ -699,6 +851,15 @@ function Show-SettingsWindow {
         $Script:Settings.LogToFile = $LogToFileCheckBox.Checked
         $Script:Settings.LogFilePath = $LogFilePathTextBox.Text
         $Script:Settings.ShowGoodbyeWindow = $ShowGoodbyeCheckBox.Checked
+        $Script:Settings.HideConsoleOnLaunch = $HideConsoleCheckBox.Checked
+
+        # Save Advanced settings
+        $Script:Settings.DirectoryListingEnabled = $DirListingCheckBox.Checked
+        $Script:Settings.Custom404PagePath = $Custom404TextBox.Text
+        $Script:Settings.LogRequestHeaders = $LogHeadersCheckBox.Checked
+        $Script:Settings.MimeTypeOverrides = $MimeTypesTextBox.Text
+        $Script:Settings.EnableKeepAlive = $KeepAliveCheckBox.Checked
+
         Save-Settings
         Write-Log "Application settings saved."
     }
@@ -717,19 +878,36 @@ function Show-HelpGuideWindow {
     $HelpForm.BackColor = [System.Drawing.Color]::White
     $HelpForm.Icon = $AppIcon # Added application icon
 
+    # --- Header ---
+    $HeaderPanel = [System.Windows.Forms.Panel]::new()
+    $HeaderPanel.Dock = [System.Windows.Forms.DockStyle]::Top
+    $HeaderPanel.Height = 70
+    $HeaderPanel.Add_Paint({Draw-GradientHeader $HeaderPanel $_})
+    $HelpForm.Controls.Add($HeaderPanel)
+
+    $HeaderLabel = [System.Windows.Forms.Label]::new()
+    $HeaderLabel.Text = "EliteSoftware HTTP Test Server - Help Guide"
+    $HeaderLabel.Font = [System.Drawing.Font]::new("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
+    $HeaderLabel.ForeColor = [System.Drawing.Color]::White
+    $HeaderLabel.AutoSize = $true
+    $HeaderLabel.Location = [System.Drawing.Point]::new(20, 20)
+    $HeaderLabel.BackColor = [System.Drawing.Color]::Transparent
+    $HeaderPanel.Controls.Add($HeaderLabel)
+
+    # --- RichTextBox for content ---
     $HelpTextBox = [System.Windows.Forms.RichTextBox]::new()
     $HelpTextBox.ReadOnly = $true
     $HelpTextBox.BorderStyle = [System.Windows.Forms.BorderStyle]::None
     $HelpTextBox.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Vertical
 
-    # Set location and size to create padding, and anchor it to all sides
+    # Set location and size to create padding, and anchor it
     $padding = 15
-    $HelpTextBox.Location = [System.Drawing.Point]::new($padding, $padding)
-    $HelpTextBox.Size = [System.Drawing.Size]::new($HelpForm.ClientSize.Width - (2 * $padding), $HelpForm.ClientSize.Height - (2 * $padding))
+    $HelpTextBox.Location = [System.Drawing.Point]::new($padding, $HeaderPanel.Height + $padding)
+    $HelpTextBox.Size = [System.Drawing.Size]::new($HelpForm.ClientSize.Width - (2 * $padding), $HelpForm.ClientSize.Height - $HeaderPanel.Height - (2 * $padding))
     $HelpTextBox.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $HelpForm.Controls.Add($HelpTextBox)
 
     # --- Define Fonts ---
-    $titleFont = [System.Drawing.Font]::new("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
     $headingFont = [System.Drawing.Font]::new("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
     $bodyFont = [System.Drawing.Font]::new("Segoe UI", 10)
     $headingColor = [System.Drawing.Color]::FromArgb(255, 0, 128, 128) # Teal
@@ -746,10 +924,6 @@ function Show-HelpGuideWindow {
 
     # --- Build the Help Document ---
     $HelpTextBox.Clear()
-
-    # Title
-    & $AppendText -Text "EliteSoftware HTTP Test Server - Help Guide" -Font $titleFont -Color [System.Drawing.Color]::Black
-    & $AppendText -Text "" -Font $bodyFont
 
     # Introduction
     & $AppendText -Text "Welcome! This guide explains how to use the application's features." -Font $bodyFont
@@ -798,8 +972,7 @@ function Show-HelpGuideWindow {
 
     # Section 4: Settings
     & $AppendText -Text "4. Settings" -Font $headingFont -Color $headingColor
-    & $AppendText -Text "Access via File > Settings..." -Font $bodyFont
-    & $AppendText -Text "Here you can configure default values for new servers and control application behavior." -Font $bodyFont
+    & $AppendText -Text "Access via File > Settings... Settings are organized into General and Advanced tabs." -Font $bodyFont
 
     $HelpForm.Controls.Add($HelpTextBox)
 
@@ -1355,9 +1528,13 @@ Write-Log "EliteSoftware HTTP Test Server v$ScriptVersion Initialized."
 $Form.ShowDialog() | Out-Null
 
 # Minimize the console window upon running
-$consoleHandle = (Get-Host).UI.RawUI.Handle
-[Runtime.InteropServices.Marshal]::PtrToStructure($consoleHandle, [Type]'System.ConsoleScreenBufferInfo').dwSize | Out-Null
-$consoleHandle = (Get-Host).UI.RawUI.Handle
-$coords = [System.Management.Automation.Host.Coordinates]::new(0, 0)
-(Get-Host).UI.RawUI.SetWindowPosition($coords)
-(Get-Host).UI.RawUI.WindowSize = [System.Management.Automation.Host.Size]::new(1, 1)
+if ($Script:Settings.HideConsoleOnLaunch) {
+    $consoleHandle = (Get-Host).UI.RawUI.Handle
+    $windowHandle = [System.Diagnostics.Process]::GetCurrentProcess().MainWindowHandle
+    $showWindowAsync = Add-Type -MemberDefinition '
+[DllImport("user32.dll")]
+public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+' -Name "Win32ShowWindowAsync" -Namespace "Win32" -PassThru
+    # SW_HIDE = 0, SW_MINIMIZE = 6
+    $showWindowAsync::ShowWindowAsync($windowHandle, 0) | Out-Null
+}
