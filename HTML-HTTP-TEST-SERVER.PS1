@@ -99,6 +99,11 @@ function Load-Settings {
         LogRequestHeaders = $false
         MimeTypeOverrides = "log=text/plain;config=application/xml"
         EnableKeepAlive = $true
+        CorsAllowedOrigins = "*" # New
+        CustomResponseHeaders = "X-Powered-By: EliteSoftware-Server" # New
+        RequestTimeoutSec = 30 # New
+        MaxConcurrentConnections = 100 # New
+        ServeIndexOn404 = $false # New
     }
 
     if (Test-Path $settingsFile) {
@@ -303,19 +308,38 @@ function Start-Server {
     # 3. Create HttpListener and Thread
     $listener = [System.Net.HttpListener]::new()
     $listener.Prefixes.Add($prefix)
+    # Set listener timeout properties from settings
+    if ($listener.TimeoutManager.GetType().GetProperty('IdleConnection')) { # Available on Windows 8+
+        $listener.TimeoutManager.IdleConnection = [System.TimeSpan]::FromSeconds($Script:Settings.RequestTimeoutSec)
+        $listener.TimeoutManager.HeaderWait = [System.TimeSpan]::FromSeconds($Script:Settings.RequestTimeoutSec)
+    }
+
+    # Use a semaphore to limit concurrent connections
+    $semaphore = [System.Threading.SemaphoreSlim]::new($Script:Settings.MaxConcurrentConnections)
 
     $thread = [System.Threading.Thread]::new({
         # Thread ScriptBlock
-        param($listener, $config, $LogQueue, $Script:IsExiting)
+        param($listener, $config, $LogQueue, $Script:IsExiting, $semaphore)
         $listener.Start()
-        $listenerState = $listener.IsListening
 
         $LogQueue.Enqueue("Server started successfully on $prefix. Root: $($config.Root)")
 
         while ($listener.IsListening -and -not $Script:IsExiting) {
             try {
-                # Wait for a request asynchronously
-                $context = $listener.GetContext()
+                # Wait for a semaphore slot to be free
+                if (-not $semaphore.Wait($Script:Settings.RequestTimeoutSec * 1000)) {
+                    $LogQueue.Enqueue("WARN: Timed out waiting for a connection slot. Max concurrent connections may be too low.")
+                    continue
+                }
+
+                # Wait for a request asynchronously with a timeout
+                $asyncResult = $listener.BeginGetContext($null, $null)
+                if (-not $asyncResult.AsyncWaitHandle.WaitOne($Script:Settings.RequestTimeoutSec * 1000)) {
+                    $LogQueue.Enqueue("WARN: Request timed out waiting for client data.")
+                    $semaphore.Release() | Out-Null
+                    continue
+                }
+                $context = $listener.EndGetContext($asyncResult)
 
                 # Process the request
                 $request = $context.Request
@@ -326,6 +350,27 @@ function Start-Server {
                 [long]$fileSize = 0
 
                 try {
+                    # --- CORS and Custom Headers ---
+                    # Handle Pre-flight OPTIONS requests
+                    if ($request.HttpMethod -eq 'OPTIONS') {
+                        $response.AddHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+                        $response.AddHeader('Access-Control-Allow-Headers', 'Content-Type')
+                    }
+                    # Add CORS origin header
+                    if (-not [string]::IsNullOrEmpty($Script:Settings.CorsAllowedOrigins)) {
+                        $response.AddHeader('Access-Control-Allow-Origin', $Script:Settings.CorsAllowedOrigins)
+                    }
+                    # Add custom headers
+                    if (-not [string]::IsNullOrEmpty($Script:Settings.CustomResponseHeaders)) {
+                        $headers = $Script:Settings.CustomResponseHeaders -split ';'
+                        foreach ($header in $headers) {
+                            $parts = $header -split ':', 2
+                            if ($parts.Length -eq 2) {
+                                $response.AddHeader($parts[0].Trim(), $parts[1].Trim())
+                            }
+                        }
+                    }
+
                     if ($config.UseRootFolderMode) {
                         # ROOT FOLDER MODE LOGIC
                         $filePath = $request.Url.LocalPath.TrimStart('/')
@@ -366,24 +411,43 @@ function Start-Server {
                         $response.StatusCode = 404
                         $response.StatusDescription = "Not Found"
                         
-                        $outputBytes = $null
-                        # Check for custom 404 page
-                        if (-not [string]::IsNullOrEmpty($Script:Settings.Custom404PagePath) -and (Test-Path $Script:Settings.Custom404PagePath -PathType Leaf)) {
-                            try {
-                                $outputBytes = [System.IO.File]::ReadAllBytes($Script:Settings.Custom404PagePath)
-                                $response.ContentType = [System.Web.MimeMapping]::GetMimeMapping($Script:Settings.Custom404PagePath)
-                            } catch {
-                                $LogQueue.Enqueue("ERROR: Failed to read custom 404 page. Falling back to default. Error: $($_.Exception.Message)")
-                                $outputBytes = [System.Text.Encoding]::UTF8.GetBytes("<html><head><title>404 Not Found</title></head><body><h1>EliteServer 404</h1><p>The requested file ($filePath) was not found. Additionally, the configured custom 404 page could not be loaded.</p></body></html>")
-                                $response.ContentType = "text/html"
+                        # SPA Support: Serve index on 404
+                        if ($Script:Settings.ServeIndexOn404 -and $config.UseRootFolderMode) {
+                            $indexPath = Join-Path -Path $config.Root -ChildPath $config.DefaultFile
+                            if (Test-Path $indexPath -PathType Leaf) {
+                                $LogQueue.Enqueue("INFO: Serving index file for 404 request (SPA mode).")
+                                $fileStream = [System.IO.File]::OpenRead($indexPath)
+                                $fileInfo = Get-Item $indexPath
+                                $fileSize = $fileInfo.Length
+
+                                $response.ContentType = [System.Web.MimeMapping]::GetMimeMapping($indexPath)
+                                $response.ContentLength64 = $fileSize
+                                $response.StatusCode = 200 # Serve as 200 OK for SPA routing
+                                $status = 200
+
+                                $fileStream.CopyTo($response.OutputStream)
+                                $fileStream.Dispose()
                             }
                         } else {
-                            $outputBytes = [System.Text.Encoding]::UTF8.GetBytes("<html><head><title>404 Not Found</title></head><body><h1>EliteServer 404</h1><p>The requested file ($filePath) was not found in the root directory.</p></body></html>")
-                            $response.ContentType = "text/html"
-                        }
+                             $outputBytes = $null
+                            # Check for custom 404 page
+                            if (-not [string]::IsNullOrEmpty($Script:Settings.Custom404PagePath) -and (Test-Path $Script:Settings.Custom404PagePath -PathType Leaf)) {
+                                try {
+                                    $outputBytes = [System.IO.File]::ReadAllBytes($Script:Settings.Custom404PagePath)
+                                    $response.ContentType = [System.Web.MimeMapping]::GetMimeMapping($Script:Settings.Custom404PagePath)
+                                } catch {
+                                    $LogQueue.Enqueue("ERROR: Failed to read custom 404 page. Falling back to default. Error: $($_.Exception.Message)")
+                                    $outputBytes = [System.Text.Encoding]::UTF8.GetBytes("<html><head><title>404 Not Found</title></head><body><h1>EliteServer 404</h1><p>The requested file ($filePath) was not found. Additionally, the configured custom 404 page could not be loaded.</p></body></html>")
+                                    $response.ContentType = "text/html"
+                                }
+                            } else {
+                                $outputBytes = [System.Text.Encoding]::UTF8.GetBytes("<html><head><title>404 Not Found</title></head><body><h1>EliteServer 404</h1><p>The requested file ($filePath) was not found in the root directory.</p></body></html>")
+                                $response.ContentType = "text/html"
+                            }
 
-                        $response.ContentLength64 = $outputBytes.Length
-                        $response.OutputStream.Write($outputBytes, 0, $outputBytes.Length)
+                            $response.ContentLength64 = $outputBytes.Length
+                            $response.OutputStream.Write($outputBytes, 0, $outputBytes.Length)
+                        }
                     }
 
                 } catch {
@@ -394,6 +458,7 @@ function Start-Server {
                     $LogQueue.Enqueue("ERROR: Request for $($filePath) failed: $($_.Exception.Message)")
                 } finally {
                     $response.OutputStream.Close()
+                    $semaphore.Release() | Out-Null # Release the semaphore slot
                 }
 
                 # Log the request
@@ -407,10 +472,12 @@ function Start-Server {
 
             } catch [System.Net.HttpListenerException] {
                 # Listener stopped gracefully
+                $semaphore.Release() | Out-Null
                 break
             } catch {
                 # General Thread Error
                 $LogQueue.Enqueue("CRITICAL ERROR in listener loop: $($_.Exception.Message)")
+                $semaphore.Release() | Out-Null
                 # Exit the loop on critical error
                 break
             }
@@ -425,7 +492,7 @@ function Start-Server {
 
     # 4. Start the Thread
     $thread.IsBackground = $true # Ensure thread stops when main process exits
-    $thread.Start($listener, $config, $Script:LogQueue, $Script:IsExiting)
+    $thread.Start($listener, $config, $Script:LogQueue, $Script:IsExiting, $semaphore)
 
     # 5. Update Global State
     $Script:ActiveServers[$config.Name] = @{
@@ -818,6 +885,71 @@ function Show-SettingsWindow {
     $MimeTypesHelpLabel.ForeColor = [System.Drawing.Color]::Gray
     $MimeTypesHelpLabel.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
     $AdvancedTabPage.Controls.Add($MimeTypesHelpLabel)
+    $yPos += 35
+
+    # --- CORS Allowed Origins ---
+    $CorsLabel = [System.Windows.Forms.Label]::new()
+    $CorsLabel.Text = "CORS Allowed Origins:"
+    $CorsLabel.AutoSize = $true
+    $CorsLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
+    $AdvancedTabPage.Controls.Add($CorsLabel)
+
+    $CorsTextBox = [System.Windows.Forms.TextBox]::new()
+    $CorsTextBox.Text = $Script:Settings.CorsAllowedOrigins
+    $CorsTextBox.Width = $controlWidth
+    $CorsTextBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
+    $AdvancedTabPage.Controls.Add($CorsTextBox)
+    $yPos += 35
+
+    # --- Custom Response Headers ---
+    $CustomHeadersLabel = [System.Windows.Forms.Label]::new()
+    $CustomHeadersLabel.Text = "Custom Response Headers:"
+    $CustomHeadersLabel.AutoSize = $true
+    $CustomHeadersLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
+    $AdvancedTabPage.Controls.Add($CustomHeadersLabel)
+
+    $CustomHeadersTextBox = [System.Windows.Forms.TextBox]::new()
+    $CustomHeadersTextBox.Text = $Script:Settings.CustomResponseHeaders
+    $CustomHeadersTextBox.Width = $controlWidth
+    $CustomHeadersTextBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
+    $AdvancedTabPage.Controls.Add($CustomHeadersTextBox)
+    $yPos += 35
+
+    # --- Request Timeout ---
+    $RequestTimeoutLabel = [System.Windows.Forms.Label]::new()
+    $RequestTimeoutLabel.Text = "Request Timeout (seconds):"
+    $RequestTimeoutLabel.AutoSize = $true
+    $RequestTimeoutLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
+    $AdvancedTabPage.Controls.Add($RequestTimeoutLabel)
+
+    $RequestTimeoutTextBox = [System.Windows.Forms.TextBox]::new()
+    $RequestTimeoutTextBox.Text = $Script:Settings.RequestTimeoutSec
+    $RequestTimeoutTextBox.Width = $controlWidth
+    $RequestTimeoutTextBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
+    $AdvancedTabPage.Controls.Add($RequestTimeoutTextBox)
+    $yPos += 35
+
+    # --- Max Concurrent Connections ---
+    $MaxConnectionsLabel = [System.Windows.Forms.Label]::new()
+    $MaxConnectionsLabel.Text = "Max Concurrent Connections:"
+    $MaxConnectionsLabel.AutoSize = $true
+    $MaxConnectionsLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
+    $AdvancedTabPage.Controls.Add($MaxConnectionsLabel)
+
+    $MaxConnectionsTextBox = [System.Windows.Forms.TextBox]::new()
+    $MaxConnectionsTextBox.Text = $Script:Settings.MaxConcurrentConnections
+    $MaxConnectionsTextBox.Width = $controlWidth
+    $MaxConnectionsTextBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
+    $AdvancedTabPage.Controls.Add($MaxConnectionsTextBox)
+    $yPos += 35
+
+    # --- Serve Index on 404 ---
+    $ServeIndexOn404CheckBox = [System.Windows.Forms.CheckBox]::new()
+    $ServeIndexOn404CheckBox.Text = "Serve Index File on 404 (for SPAs)"
+    $ServeIndexOn404CheckBox.Checked = $Script:Settings.ServeIndexOn404
+    $ServeIndexOn404CheckBox.AutoSize = $true
+    $ServeIndexOn404CheckBox.Location = [System.Drawing.Point]::new($xPos, $yPos)
+    $AdvancedTabPage.Controls.Add($ServeIndexOn404CheckBox)
 
     # --- Save and Cancel Buttons ---
     $SaveButton = [System.Windows.Forms.Button]::new()
@@ -857,6 +989,11 @@ function Show-SettingsWindow {
         $Script:Settings.LogRequestHeaders = $LogHeadersCheckBox.Checked
         $Script:Settings.MimeTypeOverrides = $MimeTypesTextBox.Text
         $Script:Settings.EnableKeepAlive = $KeepAliveCheckBox.Checked
+        $Script:Settings.CorsAllowedOrigins = $CorsTextBox.Text
+        $Script:Settings.CustomResponseHeaders = $CustomHeadersTextBox.Text
+        $Script:Settings.RequestTimeoutSec = [int]$RequestTimeoutTextBox.Text
+        $Script:Settings.MaxConcurrentConnections = [int]$MaxConnectionsTextBox.Text
+        $Script:Settings.ServeIndexOn404 = $ServeIndexOn404CheckBox.Checked
 
         Save-Settings
         Write-Log "Application settings saved."
@@ -897,11 +1034,23 @@ function Show-HelpGuideWindow {
     $HelpTextBox.ReadOnly = $true
     $HelpTextBox.BorderStyle = [System.Windows.Forms.BorderStyle]::None
     $HelpTextBox.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Vertical
+    $HelpTextBox.BackColor = $HelpForm.BackColor # Blend with form background
+
+    # --- Close Button ---
+    $CloseButton = [System.Windows.Forms.Button]::new()
+    $CloseButton.Text = "Close"
+    $CloseButton.Size = [System.Drawing.Size]::new(90, 30)
+    $CloseButton.FlatStyle = [System.Windows.Forms.FlatStyle]::System
+    $CloseButton.Location = [System.Drawing.Point]::new($HelpForm.ClientSize.Width - $CloseButton.Width - 15, $HelpForm.ClientSize.Height - $CloseButton.Height - 10)
+    $CloseButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $CloseButton.Add_Click({ $HelpForm.Close() })
+    $HelpForm.Controls.Add($CloseButton)
+    $HelpForm.CancelButton = $CloseButton # Allow Esc key to close
 
     # Set location and size to create padding, and anchor it
-    $padding = 15
-    $HelpTextBox.Location = [System.Drawing.Point]::new($padding, $HeaderPanel.Height + $padding)
-    $HelpTextBox.Size = [System.Drawing.Size]::new($HelpForm.ClientSize.Width - (2 * $padding), $HelpForm.ClientSize.Height - $HeaderPanel.Height - (2 * $padding))
+    $leftPadding = 20
+    $HelpTextBox.Location = [System.Drawing.Point]::new($leftPadding, $HeaderPanel.Height)
+    $HelpTextBox.Size = [System.Drawing.Size]::new($HelpForm.ClientSize.Width - $leftPadding, $HelpForm.ClientSize.Height - $HeaderPanel.Height - $CloseButton.Height - 20)
     $HelpTextBox.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
     $HelpForm.Controls.Add($HelpTextBox)
 
@@ -923,54 +1072,106 @@ function Show-HelpGuideWindow {
     # --- Build the Help Document ---
     $HelpTextBox.Clear()
 
+    # --- Helper function to append formatted text ---
+    $AppendText = {
+        param($Text, $Font, $Color = [System.Drawing.Color]::Black, $AddNewLine = $true, $IsListItem = $false)
+        $HelpTextBox.SelectionStart = $HelpTextBox.TextLength
+        $HelpTextBox.SelectionLength = 0
+        $HelpTextBox.SelectionFont = $Font
+        $HelpTextBox.SelectionColor = $Color
+        if ($IsListItem) {
+            $HelpTextBox.SelectionBullet = $true
+            $HelpTextBox.SelectionIndent = 20
+        }
+        $HelpTextBox.AppendText($Text + $(if ($AddNewLine) { "`r`n" } else { "" }))
+        if ($IsListItem) {
+            $HelpTextBox.SelectionBullet = $false
+            $HelpTextBox.SelectionIndent = 0
+        }
+    }
+
     # Introduction
-    & $AppendText -Text "Welcome! This guide explains how to use the application's features." -Font $bodyFont
+    & $AppendText -Text "Welcome to the EliteSoftware HTTP Test Server! This guide explains how to use the application's features." -Font $bodyFont
     & $AppendText -Text "" -Font $bodyFont
 
-    # Section 1: Server Modes
-    & $AppendText -Text "1. Server Modes" -Font $headingFont -Color $headingColor
+    # Section 1: Server Configurations
+    & $AppendText -Text "1. Managing Server Configurations" -Font $headingFont -Color $headingColor
+    & $AppendText -Text "The panel on the left allows you to save and manage multiple server configurations. All settings on the right (port, IP, file paths, etc.) are saved per-server." -Font $bodyFont
+    & $AppendText -Text "Add a Server:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   Go to File > New Server Configuration. A new server with default settings will be created." -Font $bodyFont
+    & $AppendText -Text "Switch Servers:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   Simply click on a server name in the list to load its configuration." -Font $bodyFont
+    & $AppendText -Text "Rename/Duplicate:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   Right-click a server in the list to access options for duplicating or renaming it." -Font $bodyFont
+    & $AppendText -Text "Start/Stop from List:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   You can also start or stop a server directly from the right-click context menu." -Font $bodyFont
+    & $AppendText -Text "" -Font $bodyFont
+
+    # Section 2: Server Modes
+    & $AppendText -Text "2. Server Modes" -Font $headingFont -Color $headingColor
     & $AppendText -Text "This application provides two primary modes for serving files:" -Font $bodyFont
     & $AppendText -Text "" -Font $bodyFont
     & $AppendText -Text "a) Single File Mode (Default)" -Font $bodyFont
-    & $AppendText -Text "   - Use this mode to quickly serve a single HTML file." -Font $bodyFont
-    & $AppendText -Text "   - The server will always respond with the content of the selected file, regardless of the URL path." -Font $bodyFont
-    & $AppendText -Text "   - How to use:" -Font $bodyFont
+    & $AppendText -Text "   Use this mode to quickly serve a single HTML file. The server will always respond with the content of this one file, regardless of the URL path requested. Ideal for simple tests or single-page applications." -Font $bodyFont
+    & $AppendText -Text "   How to use:" -Font $bodyFont
     & $AppendText -Text "     1. Ensure 'Use Root Folder Mode' is UNCHECKED." -Font $bodyFont
-    & $AppendText -Text "     2. Click 'Browse...' to select the HTML file you want to serve." -Font $bodyFont
+    & $AppendText -Text "     2. Click 'Browse...' next to 'Single HTML File to Serve' to select your file." -Font $bodyFont
     & $AppendText -Text "     3. Set your Port and IP, then click 'Start Server'." -Font $bodyFont
     & $AppendText -Text "" -Font $bodyFont
     & $AppendText -Text "b) Root Folder Mode" -Font $bodyFont
-    & $AppendText -Text "   - Use this mode to simulate a traditional web server by serving files from a directory." -Font $bodyFont
-    & $AppendText -Text "   - The server will map URL paths to the file and folder structure within your selected root folder." -Font $bodyFont
-    & $AppendText -Text "   - How to use:" -Font $bodyFont
+    & $AppendText -Text "   Use this mode to simulate a traditional web server. It serves files from a directory structure, mapping URL paths to files and folders within your selected root. Essential for testing multi-page websites." -Font $bodyFont
+    & $AppendText -Text "   How to use:" -Font $bodyFont
     & $AppendText -Text "     1. CHECK the 'Use Root Folder Mode' box." -Font $bodyFont
-    & $AppendText -Text "     2. Click 'Browse...' to select the main folder (root) for your website." -Font $bodyFont
+    & $AppendText -Text "     2. Click 'Browse...' next to 'Server Root Folder' to select the main folder for your website." -Font $bodyFont
     & $AppendText -Text "     3. Specify the 'Default File Name' (e.g., index.html) to be served for root requests ('/')." -Font $bodyFont
     & $AppendText -Text "     4. Set your Port and IP, then click 'Start Server'." -Font $bodyFont
     & $AppendText -Text "" -Font $bodyFont
 
-    # Section 2: Server Configurations
-    & $AppendText -Text "2. Server Configurations" -Font $headingFont -Color $headingColor
-    & $AppendText -Text "The panel on the left allows you to save and manage multiple server configurations." -Font $bodyFont
-    & $AppendText -Text "   - Add a Server: Go to File > New Server Configuration." -Font $bodyFont
-    & $AppendText -Text "   - Switch Servers: Simply click on a server name in the list to load its configuration." -Font $bodyFont
-    & $AppendText -Text "   - Rename/Duplicate: Right-click a server in the list to access options." -Font $bodyFont
-    & $AppendText -Text "" -Font $bodyFont
-
     # Section 3: Main Controls
     & $AppendText -Text "3. Main Controls" -Font $headingFont -Color $headingColor
-    & $AppendText -Text "   - Auto-Start Server: If checked, this server will start automatically when the application launches." -Font $bodyFont
-    & $AppendText -Text "   - Use Root Folder Mode: Toggles between Single File and Root Folder modes." -Font $bodyFont
-    & $AppendText -Text "   - Port: The network port the server will listen on. It auto-increments if the port is busy." -Font $bodyFont
-    & $AppendText -Text "   - IP Address to Bind: The network interface to use. '127.0.0.1' is for local access only." -Font $bodyFont
-    & $AppendText -Text "   - Start/Stop Server: Controls the currently selected server." -Font $bodyFont
-    & $AppendText -Text "   - Open in Browser: Opens the server's URL in your default web browser." -Font $bodyFont
-    & $AppendText -Text "   - Log Window: Displays live server activity, requests, and errors." -Font $bodyFont
+    & $AppendText -Text "Auto-Start This Server on Launch:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   If checked, this specific server configuration will attempt to start automatically when the application launches." -Font $bodyFont
+    & $AppendText -Text "IP Address to Bind:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   The network interface to use. '127.0.0.1' is for local machine access only. Select a specific IP to allow other devices on your network to connect." -Font $bodyFont
+    & $AppendText -Text "Server Port:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   The network port the server will listen on. If the port is in use, the server will automatically try the next available port." -Font $bodyFont
+    & $AppendText -Text "Start/Stop/Open Buttons:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   These control the currently selected server and allow you to open its URL in your default web browser." -Font $bodyFont
+    & $AppendText -Text "Log Window:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   Displays live server activity, including requests, status codes, file sizes, and errors." -Font $bodyFont
     & $AppendText -Text "" -Font $bodyFont
 
     # Section 4: Settings
-    & $AppendText -Text "4. Settings" -Font $headingFont -Color $headingColor
-    & $AppendText -Text "Access via File > Settings... Settings are organized into General and Advanced tabs." -Font $bodyFont
+    & $AppendText -Text "4. Application Settings (File > Settings...)" -Font $headingFont -Color $headingColor
+    & $AppendText -Text "Settings are organized into General and Advanced tabs and apply globally." -Font $bodyFont
+    & $AppendText -Text "" -Font $bodyFont
+    & $AppendText -Text "a) General Settings" -Font $bodyFont
+    & $AppendText -Text "Default Root/File/Port/IP:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   Sets the default values for newly created server configurations." -Font $bodyFont
+    & $AppendText -Text "Max Log Lines:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   Controls how many lines are kept in the log window to prevent performance issues." -Font $bodyFont
+    & $AppendText -Text "Enable Logging to File:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   When checked, all log entries are also written to the specified file path." -Font $bodyFont
+    & $AppendText -Text "Hide Console Window:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   If checked, the black PowerShell console window will be hidden the next time you launch the application." -Font $bodyFont
+    & $AppendText -Text "" -Font $bodyFont
+
+    & $AppendText -Text "b) Advanced Settings" -Font $bodyFont
+    & $AppendText -Text "Enable Directory Listing:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   (NOT YET IMPLEMENTED) When a user requests a directory instead of a file, this will show a list of its contents." -Font $bodyFont
+    & $AppendText -Text "Custom 404 Error Page:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   Specify a path to an HTML file that will be served whenever a requested file is not found (404 error)." -Font $bodyFont
+    & $AppendText -Text "Log Full Request Headers:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   A verbose option for debugging. When checked, the full HTTP headers of every incoming request will be printed to the log." -Font $bodyFont
+    & $AppendText -Text "MIME Type Overrides:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   (NOT YET IMPLEMENTED) Manually define content types for specific file extensions (e.g., 'log=text/plain')." -Font $bodyFont
+    & $AppendText -Text "Enable HTTP Keep-Alive:" -Font $bodyFont -IsListItem $true
+    & $AppendText -Text "   (NOT YET IMPLEMENTED) Allows clients to reuse the same TCP connection for multiple requests, improving performance." -Font $bodyFont
+    & $AppendText -Text "" -Font $bodyFont
+
+    # Version Info
+    & $AppendText -Text "Version: $ScriptVersion" -Font $bodyFont
+    & $AppendText -Text "Created by Zachary Whiteman & GitHub Copilot" -Font $bodyFont
 
     $HelpForm.Controls.Add($HelpTextBox)
 
@@ -1202,21 +1403,7 @@ $DefaultFileTextBox.Location = [System.Drawing.Point]::new([int]$xStart, ($yPos 
 $ContentPanel.Controls.Add($DefaultFileTextBox)
 
 
-# --- Port Controls ---
-$PortLabel = [System.Windows.Forms.Label]::new()
-$PortLabel.Text = "Server Port:"
-$PortLabel.Font = [System.Drawing.Font]::new("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
-$PortLabel.AutoSize = $true
-$PortLabel.Location = [System.Drawing.Point]::new(([int]$xStart + 280), $yPos) # Adjusted X
-$ContentPanel.Controls.Add($PortLabel)
-
-$PortTextBox = [System.Windows.Forms.TextBox]::new()
-$PortTextBox.Text = "8080"
-$PortTextBox.Width = 80
-$PortTextBox.Location = [System.Drawing.Point]::new(([int]$xStart + 280), ($yPos + 25)) # Adjusted X
-$ContentPanel.Controls.Add($PortTextBox)
-
-# --- IP Address Selection ---
+# --- IP Address and Port Controls ---
 $yPos += 60 # Corrected Y position
 $IPLabel = [System.Windows.Forms.Label]::new()
 $IPLabel.Text = "IP Address to Bind:"
@@ -1226,12 +1413,24 @@ $IPLabel.Location = [System.Drawing.Point]::new([int]$xStart, $yPos)
 $ContentPanel.Controls.Add($IPLabel)
 
 $IPComboBox = [System.Windows.Forms.ComboBox]::new()
-$IPComboBox.Width = 320
+$IPComboBox.Width = 250 # Adjusted width
 $IPComboBox.DropDownHeight = 150
 $IPComboBox.Items.AddRange((Get-LocalIPv4Addresses))
-
 $IPComboBox.Location = [System.Drawing.Point]::new([int]$xStart, ($yPos + 25))
 $ContentPanel.Controls.Add($IPComboBox)
+
+$PortLabel = [System.Windows.Forms.Label]::new()
+$PortLabel.Text = "Server Port:"
+$PortLabel.Font = [System.Drawing.Font]::new("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$PortLabel.AutoSize = $true
+$PortLabel.Location = [System.Drawing.Point]::new($IPComboBox.Right + 20, $yPos)
+$ContentPanel.Controls.Add($PortLabel)
+
+$PortTextBox = [System.Windows.Forms.TextBox]::new()
+$PortTextBox.Text = "8080"
+$PortTextBox.Width = 100
+$PortTextBox.Location = [System.Drawing.Point]::new($IPComboBox.Right + 20, ($yPos + 25))
+$ContentPanel.Controls.Add($PortTextBox)
 
 
 # --- Action Buttons with Colored Border Panels ---
