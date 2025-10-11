@@ -1,19 +1,10 @@
-# EliteSoftware HTML - HTTP Test Server v1.3.0.0 - Created by: Zachary Whiteman & Google Gemini Ai. 2025-10-10 - 19:17 EDT
+# EliteSoftware HTML - HTTP Test Server v1.4.2.0 - Created by: Zachary Whiteman & Google Gemini Ai. 2025-10-11 - 03:30 EDT
 
 <#
     This script implements a multi-server HTTP test platform GUI using PowerShell WinForms and threading.
 
-    FIXES IN V1.3.0.0:
-    - Addressed the Add-Type error concern (assembly loads correctly from GAC, error is environment noise).
-    - Fully implemented the HTTP server using System.Net.HttpListener on a separate thread for stability.
-
-    FEATURE ENHANCEMENTS IN V1.3.0.0:
-    - **Multi-Server UI:** Increased Form width, added MenuStrip and a left-hand Sidebar for config management.
-    - **Configuration Saving:** Saves/loads up to 10 server configurations to the specified AppData path.
-    - **Graceful Exit:** Added "Exit" button with tooltip, server shutdown logic, and themed "Goodbye" popup window.
-    - **Dynamic Port Check:** Automatically adjusts port by +1 if a conflict is detected on start.
-    - **Open in Browser Button:** Added button to quickly test the hosted URL.
-    - **Custom Icon:** Looks for 'custom-icon.ico' in the config folder, falls back to default if not found.
+    FIXES IN V1.4.2.0:
+    - **Fixed Instant Crash:** Corrected a critical syntax error in the "Duplicate Configuration" logic that caused the application to crash immediately on launch.
 #>
 
 # ==============================================================================
@@ -21,15 +12,19 @@
 # ==============================================================================
 
 # Script Versioning
-[string]$ScriptVersion = "v1.3.0.0"
+[string]$ScriptVersion = "v1.4.2.0"
 
 # Load required .NET assemblies
-# The 'Add-Type -AssemblyName System.Drawing.Drawing2D' often generates a benign file-not-found error in some editors,
-# but it loads correctly from the GAC and is required for the gradient brush.
+# The 'Add-Type' for Drawing2D often generates a benign file-not-found error in some editors,
+# but it loads correctly from the GAC. We suppress the warning.
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Net
-Add-Type -AssemblyName System.Drawing.Drawing2D
+try {
+    Add-Type -AssemblyName "System.Drawing.Drawing2D, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" -ErrorAction SilentlyContinue
+} catch {
+    # This space intentionally left blank.
+}
 
 # Enable system visual styles (essential for theming)
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -57,7 +52,7 @@ function Get-AppIcon {
 
 # Variable Definitions
 [int]$FormWidth = 900 # Increased width for sidebar
-[int]$FormHeight = 560
+[int]$FormHeight = 610
 [int]$xStart = 30 # X coordinate for starting controls
 [int]$SidebarWidth = 250
 [int]$ContentXStart = $SidebarWidth + 30 # Start of main controls
@@ -72,11 +67,54 @@ $Script:ServerConfigs = @() # Array of saved configuration objects
 $Script:CurrentConfigIndex = 0 # Index of the currently selected configuration
 $Script:ActiveServers = @{} # Hashtable to track running HttpListener objects {ConfigName: {Listener: <obj>, Thread: <obj>}}
 $Script:LogQueue = [System.Collections.Queue]::new() # Thread-safe queue for logging
+$Script:LogTimer = $null # Timer for polling the log queue
 $Script:IsExiting = $false # Flag for graceful exit
+$Script:Settings = $null # Global settings object
 
 # ==============================================================================
 # 2. Configuration Management Functions
 # ==============================================================================
+
+function Load-Settings {
+    $settingsFile = Join-Path -Path $configPath -ChildPath "settings.json"
+    $defaultSettings = @{
+        DefaultRoot = "C:\inetpub\wwwroot"
+        DefaultFile = "index.html"
+        DefaultPort = 8080
+        DefaultIP = "127.0.0.1"
+        MaxLogLines = 200
+        LogToFile = $false
+        LogFilePath = (Join-Path -Path $configPath -ChildPath "server.log")
+        ShowGoodbyeWindow = $true
+    }
+
+    if (Test-Path $settingsFile) {
+        try {
+            $json = Get-Content $settingsFile -Raw
+            $Script:Settings = $json | ConvertFrom-Json
+            # Ensure all default keys exist
+            foreach ($key in $defaultSettings.Keys) {
+                if (-not $Script:Settings.PSObject.Properties.Match($key)) {
+                    $Script:Settings | Add-Member -MemberType NoteProperty -Name $key -Value $defaultSettings[$key]
+                }
+            }
+        } catch {
+            Write-Warning "Failed to load settings.json, using defaults. Error: $($_.Exception.Message)"
+            $Script:Settings = [PSCustomObject]$defaultSettings
+        }
+    } else {
+        $Script:Settings = [PSCustomObject]$defaultSettings
+    }
+}
+
+function Save-Settings {
+    $settingsFile = Join-Path -Path $configPath -ChildPath "settings.json"
+    try {
+        $Script:Settings | ConvertTo-Json -Depth 3 | Out-File -FilePath $settingsFile -Encoding UTF8
+    } catch {
+        Write-Error "Failed to save settings to '$settingsFile'. Error: $($_.Exception.Message)"
+    }
+}
 
 function Save-ServerConfig {
     try {
@@ -118,58 +156,106 @@ function Load-ServerConfigs {
                 Port = 8080
                 IP = "127.0.0.1"
                 Status = "Stopped"
+                UseRootFolderMode = $false
+                SingleFilePath = "C:\path\to\your\file.html"
+                AutoStart = $false
             }
         )
     }
 
-    # Ensure all configs have the 'Status' property
+    # Ensure all configs have the required properties
     $Script:ServerConfigs = $Script:ServerConfigs | ForEach-Object {
         if (-not $_.PSObject.Properties.Match('Status')) {
             $_ | Add-Member -MemberType NoteProperty -Name Status -Value "Stopped" -Force
+        }
+        if (-not $_.PSObject.Properties.Match('UseRootFolderMode')) {
+            $_ | Add-Member -MemberType NoteProperty -Name UseRootFolderMode -Value $false -Force
+        }
+        if (-not $_.PSObject.Properties.Match('SingleFilePath')) {
+            $_ | Add-Member -MemberType NoteProperty -Name SingleFilePath -Value "" -Force
+        }
+        if (-not $_.PSObject.Properties.Match('AutoStart')) {
+            $_ | Add-Member -MemberType NoteProperty -Name AutoStart -Value $false -Force
         }
         $_
     }
 }
 
 function Add-NewConfig {
+    # Find the highest port number currently in use and add 1
+    $nextPort = if ($Script:ServerConfigs.Count -gt 0) {
+        ($Script:ServerConfigs.Port | ForEach-Object { [int]$_ } | Measure-Object -Maximum).Maximum + 1
+    } else {
+        $Script:Settings.DefaultPort # Start with default if no servers exist
+    }
+
     $newConfig = [PSCustomObject]@{
         Name = "New Server $($Script:ServerConfigs.Count + 1)"
-        Root = "C:\web\test"
-        DefaultFile = "test.html"
-        Port = 8080 + $Script:ServerConfigs.Count
-        IP = "127.0.0.1"
+        Root = $Script:Settings.DefaultRoot
+        DefaultFile = $Script:Settings.DefaultFile
+        Port = $nextPort
+        IP = $Script:Settings.DefaultIP
         Status = "Stopped"
+        UseRootFolderMode = $false
+        SingleFilePath = ""
+        AutoStart = $false
     }
     $Script:ServerConfigs += $newConfig
     Save-ServerConfig
 }
 
 function Update-GUIFromConfig {
-    if ($Script:ServerConfigs.Count -gt $Script:CurrentConfigIndex) {
+    if ($Script:ServerConfigs.Count -gt $Script:CurrentConfigIndex -and $Form.IsHandleCreated) {
         $config = $Script:ServerConfigs[$Script:CurrentConfigIndex]
-        $Form.Invoke([scriptblock]{
-            param($config)
-            $RootTextBox.Text = $config.Root
-            $DefaultFileTextBox.Text = $config.DefaultFile
-            $PortTextBox.Text = $config.Port
-            $IPComboBox.Text = $config.IP
+        $Form.Invoke([System.Action] {
+            $configParam = $Script:ServerConfigs[$Script:CurrentConfigIndex]
+            # Update common controls
+            $PortTextBox.Text = $configParam.Port
+            $IPComboBox.Text = $configParam.IP
 
-            $Form.Text = "EliteSoftware HTTP Test Server - $($config.Name)"
-            $HeaderLabel.Text = "HTTP Server: $($config.Name)"
+            # Update mode-specific controls
+            $RootModeCheckBox.Checked = $configParam.UseRootFolderMode
+            $RootTextBox.Text = $configParam.Root
+            $DefaultFileTextBox.Text = $configParam.DefaultFile
+            $SingleFileTextBox.Text = $configParam.SingleFilePath
+            $AutoStartCheckBox.Checked = $configParam.AutoStart
+
+            # Toggle visibility based on mode
+            $isRootMode = $configParam.UseRootFolderMode
+            $RootLabel.Visible = $isRootMode
+            $RootTextBox.Visible = $isRootMode
+            $BrowseButton.Visible = $isRootMode
+            $DefaultFileLabel.Visible = $isRootMode
+            $DefaultFileTextBox.Visible = $isRootMode
+            $SingleFileLabel.Visible = -not $isRootMode
+            $SingleFileTextBox.Visible = -not $isRootMode
+            $SingleFileBrowseButton.Visible = -not $isRootMode
+
+            # Update form text and header
+            $Form.Text = "EliteSoftware HTTP Test Server - $($configParam.Name)"
+            $HeaderLabel.Text = "HTTP Server: $($configParam.Name)"
 
             $SidebarList.SelectedIndex = $Script:CurrentConfigIndex
-            Update-ServerButtons $config.Status # Update buttons based on the config's status
-        }, $config)
+            Update-ServerButtons $configParam.Status # Update buttons based on the config's status
+        })
     }
 }
 
 function Update-ConfigFromGUI {
     if ($Script:ServerConfigs.Count -gt $Script:CurrentConfigIndex) {
         $config = $Script:ServerConfigs[$Script:CurrentConfigIndex]
+        # Ensure the object is a modifiable PSCustomObject
+        if ($config -isnot [System.Management.Automation.PSCustomObject]) {
+            $config = $config | Select-Object *
+            $Script:ServerConfigs[$Script:CurrentConfigIndex] = $config
+        }
         $config.Root = $RootTextBox.Text
         $config.DefaultFile = $DefaultFileTextBox.Text
         $config.Port = [int]$PortTextBox.Text
         $config.IP = $IPComboBox.Text
+        $config.UseRootFolderMode = $RootModeCheckBox.Checked
+        $config.SingleFilePath = $SingleFileTextBox.Text
+        $config.AutoStart = $AutoStartCheckBox.Checked
         Save-ServerConfig
     }
 }
@@ -178,15 +264,15 @@ function Update-ConfigFromGUI {
 # 3. HTTP Server and Request Handling
 # ==============================================================================
 
-# Cross-thread GUI update function
-function Invoke-GUIUpdate {
-    param([scriptblock]$ScriptBlock)
-    if ($Form.InvokeRequired) {
-        $Form.Invoke($ScriptBlock)
-    } else {
-        & $ScriptBlock
-    }
+function Get-LocalIPv4Addresses {
+    Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias * | Where-Object { $_.AddressFamily -eq 'IPv4' -and $_.InterfaceType -ne 'Loopback' -and $_.IPAddress -ne '127.0.0.1' } | Select-Object -ExpandProperty IPAddress
 }
+
+
+
+# ==============================================================================
+# 3. HTTP Server and Request Handling
+# ==============================================================================
 
 function Start-Server {
     param($config)
@@ -234,17 +320,25 @@ function Start-Server {
                 [long]$fileSize = 0
 
                 try {
-                    $filePath = $request.Url.LocalPath.TrimStart('/')
-                    if ([string]::IsNullOrEmpty($filePath) -or $filePath -eq '/') {
-                        $filePath = $config.DefaultFile
-                    }
-                    
-                    # Prevent directory traversal
-                    if ($filePath.Contains('..')) {
-                        throw [System.Security.SecurityException]::new("Directory traversal attempt detected.")
+                    if ($config.UseRootFolderMode) {
+                        # ROOT FOLDER MODE LOGIC
+                        $filePath = $request.Url.LocalPath.TrimStart('/')
+                        if ([string]::IsNullOrEmpty($filePath) -or $filePath -eq '/') {
+                            $filePath = $config.DefaultFile
+                        }
+                        
+                        # Prevent directory traversal
+                        if ($filePath.Contains('..')) {
+                            throw [System.Security.SecurityException]::new("Directory traversal attempt detected.")
+                        }
+
+                        $fullPath = Join-Path -Path $config.Root -ChildPath $filePath
+                    } else {
+                        # SINGLE FILE MODE LOGIC
+                        $filePath = [System.IO.Path]::GetFileName($config.SingleFilePath)
+                        $fullPath = $config.SingleFilePath
                     }
 
-                    $fullPath = Join-Path -Path $config.Root -ChildPath $filePath
 
                     if (Test-Path $fullPath -PathType Leaf) {
                         # Serve file
@@ -386,36 +480,40 @@ function Update-ServerButtons {
 }
 
 function Write-Log ($message) {
-    $LogTextBox.AppendText("$(Get-Date -Format 'HH:mm:ss') - $message`r`n")
-    # Clean up old log lines if it gets too long
-    if ($LogTextBox.Lines.Count -gt 50) {
-        $LogTextBox.Text = $LogTextBox.Text.Substring($LogTextBox.Lines[0].Length + 2)
+    if ($LogTextBox) {
+        $LogTextBox.AppendText("$(Get-Date -Format 'HH:mm:ss') - $message`r`n")
+        # Clean up old log lines if it gets too long
+        if ($LogTextBox.Lines.Count -gt $Script:Settings.MaxLogLines) {
+            $LogTextBox.Text = $LogTextBox.Text.Substring($LogTextBox.Lines[0].Length + 2)
+        }
+    } else {
+        # Fallback to console if LogTextBox is not yet initialized
+        Write-Host "$(Get-Date -Format 'HH:mm:ss') - $message"
+    }
+
+    if ($Script:Settings.LogToFile) {
+        try {
+            "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $message" | Out-File -FilePath $Script:Settings.LogFilePath -Append -Encoding UTF8
+        } catch {
+            # Disable to prevent spamming errors
+            $Script:Settings.LogToFile = $false
+            Write-Log "ERROR: Could not write to log file '$($Script:Settings.LogFilePath)'. Disabling file logging. Error: $($_.Exception.Message)"
+        }
     }
 }
 
 # Timer to poll the log queue and update the GUI safely
 function Start-LogTimer {
-    $LogTimer = [System.Windows.Forms.Timer]::new()
-    $LogTimer.Interval = 100 # Check every 100ms
-    $LogTimer.Add_Tick({
+    $Script:LogTimer = [System.Windows.Forms.Timer]::new()
+    $Script:LogTimer.Interval = 100 # Check every 100ms
+    $Script:LogTimer.Add_Tick({
         # Process log messages from the queue
         while ($Script:LogQueue.Count -gt 0) {
             $message = $Script:LogQueue.Dequeue()
             Write-Log $message
         }
     })
-    $LogTimer.Start()
-    $Form.Tag = $LogTimer # Store timer in Form tag for later disposal
-
-    # Cleanup routine on form closing
-    $Form.Add_FormClosing({
-        $Script:IsExiting = $true # Signal threads to stop
-        # Stop all running servers gracefully
-        $Script:ServerConfigs | Where-Object {$_.Status -eq "Running"} | ForEach-Object {
-            Stop-Server $_
-        }
-        $LogTimer.Stop()
-    })
+    $Script:LogTimer.Start()
 }
 
 function Show-GoodbyeWindow {
@@ -425,15 +523,14 @@ function Show-GoodbyeWindow {
     $GoodbyeForm.Text = "Closing Application"
     $GoodbyeForm.Size = [System.Drawing.Size]::new(500, 200)
     $GoodbyeForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-    $GoodbyeForm.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None # No borders or title bar
-    $GoodbyeForm.BackColor = [System.Drawing.Color]::FromArgb(255, 240, 240, 240) # Light grey background
-
-    # Header Panel (Matches Main Form)
-    $HeaderPanelGoodbye = [System.Windows.Forms.Panel]::new()
-    $HeaderPanelGoodbye.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $HeaderPanelGoodbye.Add_Paint({Draw-GradientHeader $HeaderPanelGoodbye $_})
-    $GoodbyeForm.Controls.Add($HeaderPanelGoodbye)
+    $GoodbyeForm.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
     
+    # Paint the gradient directly onto the form's background
+    $GoodbyeForm.Add_Paint({
+        param($sender, $e)
+        Draw-GradientHeader $sender $e
+    })
+
     # Message Label (Matches Header Font/Color)
     $GoodbyeLabel = [System.Windows.Forms.Label]::new()
     $GoodbyeLabel.Text = $Message
@@ -443,13 +540,12 @@ function Show-GoodbyeWindow {
     $GoodbyeLabel.AutoSize = $true
     
     # Center the label
-    $GoodbyeLabel.Location = [System.Drawing.Point]::new(($GoodbyeForm.Width - $GoodbyeLabel.Width) / 2 - 10, ($GoodbyeForm.Height - $GoodbyeLabel.Height) / 2 - 10)
-    $HeaderPanelGoodbye.Controls.Add($GoodbyeLabel)
+    $GoodbyeForm.Controls.Add($GoodbyeLabel)
 
     # Show the modal form non-blockingly
     $GoodbyeForm.Show() | Out-Null
     
-    # Update label position after it has been shown and sized
+    # Update label location after it has been shown and sized
     $GoodbyeLabel.Location = [System.Drawing.Point]::new(($GoodbyeForm.Width - $GoodbyeLabel.Width) / 2, ($GoodbyeForm.Height - $GoodbyeLabel.Height) / 2)
 
     # Use a System.Threading.Timer for non-blocking delay
@@ -461,11 +557,262 @@ function Show-GoodbyeWindow {
     $GoodbyeForm.Tag = $delayTimer # Hold reference to prevent garbage collection
 }
 
+function Show-SettingsWindow {
+    $SettingsForm = [System.Windows.Forms.Form]::new()
+    $SettingsForm.Text = "Application Settings"
+    $SettingsForm.Size = [System.Drawing.Size]::new(550, 450)
+    $SettingsForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $SettingsForm.MinimizeBox = $false
+    $SettingsForm.MaximizeBox = $false
+    $SettingsForm.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $SettingsForm.BackColor = [System.Drawing.Color]::FromArgb(255, 240, 240, 240)
+
+    $yPos = 20
+    $xPos = 20
+    $labelWidth = 200
+    $controlWidth = 280
+
+    # --- Default Root ---
+    $DefaultRootLabel = [System.Windows.Forms.Label]::new()
+    $DefaultRootLabel.Text = "Default Root for New Servers:"
+    $DefaultRootLabel.AutoSize = $true
+    $DefaultRootLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
+    $SettingsForm.Controls.Add($DefaultRootLabel)
+
+    $DefaultRootTextBox = [System.Windows.Forms.TextBox]::new()
+    $DefaultRootTextBox.Text = $Script:Settings.DefaultRoot
+    $DefaultRootTextBox.Width = $controlWidth
+    $DefaultRootTextBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
+    $SettingsForm.Controls.Add($DefaultRootTextBox)
+    $yPos += 35
+
+    # --- Default File ---
+    $DefaultFileLabel = [System.Windows.Forms.Label]::new()
+    $DefaultFileLabel.Text = "Default File for New Servers:"
+    $DefaultFileLabel.AutoSize = $true
+    $DefaultFileLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
+    $SettingsForm.Controls.Add($DefaultFileLabel)
+
+    $DefaultFileTextBox = [System.Windows.Forms.TextBox]::new()
+    $DefaultFileTextBox.Text = $Script:Settings.DefaultFile
+    $DefaultFileTextBox.Width = $controlWidth
+    $DefaultFileTextBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
+    $SettingsForm.Controls.Add($DefaultFileTextBox)
+    $yPos += 35
+
+    # --- Default Port ---
+    $DefaultPortLabel = [System.Windows.Forms.Label]::new()
+    $DefaultPortLabel.Text = "Default Port for New Servers:"
+    $DefaultPortLabel.AutoSize = $true
+    $DefaultPortLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
+    $SettingsForm.Controls.Add($DefaultPortLabel)
+
+    $DefaultPortTextBox = [System.Windows.Forms.TextBox]::new()
+    $DefaultPortTextBox.Text = $Script:Settings.DefaultPort
+    $DefaultPortTextBox.Width = $controlWidth
+    $DefaultPortTextBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
+    $SettingsForm.Controls.Add($DefaultPortTextBox)
+    $yPos += 35
+
+    # --- Default IP Address ---
+    $DefaultIPLabel = [System.Windows.Forms.Label]::new()
+    $DefaultIPLabel.Text = "Default IP for New Servers:"
+    $DefaultIPLabel.AutoSize = $true
+    $DefaultIPLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
+    $SettingsForm.Controls.Add($DefaultIPLabel)
+
+    $DefaultIPComboBox = [System.Windows.Forms.ComboBox]::new()
+    $DefaultIPComboBox.Items.Add("127.0.0.1")
+    $DefaultIPComboBox.Items.AddRange((Get-LocalIPv4Addresses))
+    $DefaultIPComboBox.Text = $Script:Settings.DefaultIP
+    $DefaultIPComboBox.Width = $controlWidth
+    $DefaultIPComboBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
+    $SettingsForm.Controls.Add($DefaultIPComboBox)
+    $yPos += 35
+
+    # --- Max Log Lines ---
+    $MaxLogLinesLabel = [System.Windows.Forms.Label]::new()
+    $MaxLogLinesLabel.Text = "Max Log Lines in GUI:"
+    $MaxLogLinesLabel.AutoSize = $true
+    $MaxLogLinesLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
+    $SettingsForm.Controls.Add($MaxLogLinesLabel)
+
+    $MaxLogLinesTextBox = [System.Windows.Forms.TextBox]::new()
+    $MaxLogLinesTextBox.Text = $Script:Settings.MaxLogLines
+    $MaxLogLinesTextBox.Width = $controlWidth
+    $MaxLogLinesTextBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
+    $SettingsForm.Controls.Add($MaxLogLinesTextBox)
+    $yPos += 35
+
+    # --- Log to File Checkbox ---
+    $LogToFileCheckBox = [System.Windows.Forms.CheckBox]::new()
+    $LogToFileCheckBox.Text = "Enable Logging to File"
+    $LogToFileCheckBox.Checked = $Script:Settings.LogToFile
+    $LogToFileCheckBox.AutoSize = $true
+    $LogToFileCheckBox.Location = [System.Drawing.Point]::new($xPos, $yPos)
+    $SettingsForm.Controls.Add($LogToFileCheckBox)
+    $yPos += 35
+
+    # --- Log File Path ---
+    $LogFilePathLabel = [System.Windows.Forms.Label]::new()
+    $LogFilePathLabel.Text = "Log File Path:"
+    $LogFilePathLabel.AutoSize = $true
+    $LogFilePathLabel.Location = [System.Drawing.Point]::new($xPos, $yPos + 3)
+    $SettingsForm.Controls.Add($LogFilePathLabel)
+
+    $LogFilePathTextBox = [System.Windows.Forms.TextBox]::new()
+    $LogFilePathTextBox.Text = $Script:Settings.LogFilePath
+    $LogFilePathTextBox.Width = $controlWidth
+    $LogFilePathTextBox.Location = [System.Drawing.Point]::new($xPos + $labelWidth, $yPos)
+    $SettingsForm.Controls.Add($LogFilePathTextBox)
+    $yPos += 35
+
+    # --- Show Goodbye Window Checkbox ---
+    $ShowGoodbyeCheckBox = [System.Windows.Forms.CheckBox]::new()
+    $ShowGoodbyeCheckBox.Text = "Show Goodbye Window on Exit"
+    $ShowGoodbyeCheckBox.Checked = $Script:Settings.ShowGoodbyeWindow
+    $ShowGoodbyeCheckBox.AutoSize = $true
+    $ShowGoodbyeCheckBox.Location = [System.Drawing.Point]::new($xPos, $yPos)
+    $SettingsForm.Controls.Add($ShowGoodbyeCheckBox)
+    $yPos += 50
+
+    # --- Save and Cancel Buttons ---
+    $SaveButton = [System.Windows.Forms.Button]::new()
+    $SaveButton.Text = "Save"
+    $SaveButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $SaveButton.Location = [System.Drawing.Point]::new($SettingsForm.Width - 220, $SettingsForm.Height - 80)
+    $SaveButton.FlatStyle = [System.Windows.Forms.FlatStyle]::System
+    $SettingsForm.Controls.Add($SaveButton)
+
+    $CancelButton = [System.Windows.Forms.Button]::new()
+    $CancelButton.Text = "Cancel"
+    $CancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $CancelButton.Location = [System.Drawing.Point]::new($SettingsForm.Width - 130, $SettingsForm.Height - 80)
+    $CancelButton.FlatStyle = [System.Windows.Forms.FlatStyle]::System
+    $SettingsForm.Controls.Add($CancelButton)
+
+    $SettingsForm.AcceptButton = $SaveButton
+    $SettingsForm.CancelButton = $CancelButton
+
+    if ($SettingsForm.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        # Save the settings
+        $Script:Settings.DefaultRoot = $DefaultRootTextBox.Text
+        $Script:Settings.DefaultFile = $DefaultFileTextBox.Text
+        $Script:Settings.DefaultPort = [int]$DefaultPortTextBox.Text
+        $Script:Settings.DefaultIP = $DefaultIPComboBox.Text
+        $Script:Settings.MaxLogLines = [int]$MaxLogLinesTextBox.Text
+        $Script:Settings.LogToFile = $LogToFileCheckBox.Checked
+        $Script:Settings.LogFilePath = $LogFilePathTextBox.Text
+        $Script:Settings.ShowGoodbyeWindow = $ShowGoodbyeCheckBox.Checked
+        Save-Settings
+        Write-Log "Application settings saved."
+    }
+
+    $SettingsForm.Dispose()
+}
+
+function Show-HelpGuideWindow {
+    $HelpForm = [System.Windows.Forms.Form]::new()
+    $HelpForm.Text = "Help Guide"
+    $HelpForm.Size = [System.Drawing.Size]::new(650, 550)
+    $HelpForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $HelpForm.MinimizeBox = $false
+    $HelpForm.MaximizeBox = $false
+    $HelpForm.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $HelpForm.BackColor = [System.Drawing.Color]::White
+
+    $HelpTextBox = [System.Windows.Forms.RichTextBox]::new()
+    $HelpTextBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $HelpTextBox.ReadOnly = $true
+    $HelpTextBox.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $HelpTextBox.Margin = [System.Windows.Forms.Padding]::new(15) # Add padding around the text
+    $HelpTextBox.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Vertical
+
+    # --- Define Fonts ---
+    $titleFont = [System.Drawing.Font]::new("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
+    $headingFont = [System.Drawing.Font]::new("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+    $bodyFont = [System.Drawing.Font]::new("Segoe UI", 10)
+    $headingColor = [System.Drawing.Color]::FromArgb(255, 0, 128, 128) # Teal
+
+    # --- Helper function to append formatted text ---
+    $AppendText = {
+        param($Text, $Font, $Color = [System.Drawing.Color]::Black, $AddNewLine = $true)
+        $HelpTextBox.SelectionStart = $HelpTextBox.TextLength
+        $HelpTextBox.SelectionLength = 0
+        $HelpTextBox.SelectionFont = $Font
+        $HelpTextBox.SelectionColor = $Color
+        $HelpTextBox.AppendText($Text + $(if ($AddNewLine) { "`r`n" } else { "" }))
+    }
+
+    # --- Build the Help Document ---
+    $HelpTextBox.Clear()
+
+    # Title
+    & $AppendText -Text "EliteSoftware HTTP Test Server - Help Guide" -Font $titleFont -Color [System.Drawing.Color]::Black
+    & $AppendText -Text "" -Font $bodyFont
+
+    # Introduction
+    & $AppendText -Text "Welcome! This guide explains how to use the application's features." -Font $bodyFont
+    & $AppendText -Text "" -Font $bodyFont
+
+    # Section 1: Server Modes
+    & $AppendText -Text "1. Server Modes" -Font $headingFont -Color $headingColor
+    & $AppendText -Text "This application provides two primary modes for serving files:" -Font $bodyFont
+    & $AppendText -Text "" -Font $bodyFont
+    & $AppendText -Text "a) Single File Mode (Default)" -Font $bodyFont
+    & $AppendText -Text "   - Use this mode to quickly serve a single HTML file." -Font $bodyFont
+    & $AppendText -Text "   - The server will always respond with the content of the selected file, regardless of the URL path." -Font $bodyFont
+    & $AppendText -Text "   - How to use:" -Font $bodyFont
+    & $AppendText -Text "     1. Ensure 'Use Root Folder Mode' is UNCHECKED." -Font $bodyFont
+    & $AppendText -Text "     2. Click 'Browse...' to select the HTML file you want to serve." -Font $bodyFont
+    & $AppendText -Text "     3. Set your Port and IP, then click 'Start Server'." -Font $bodyFont
+    & $AppendText -Text "" -Font $bodyFont
+    & $AppendText -Text "b) Root Folder Mode" -Font $bodyFont
+    & $AppendText -Text "   - Use this mode to simulate a traditional web server by serving files from a directory." -Font $bodyFont
+    & $AppendText -Text "   - The server will map URL paths to the file and folder structure within your selected root folder." -Font $bodyFont
+    & $AppendText -Text "   - How to use:" -Font $bodyFont
+    & $AppendText -Text "     1. CHECK the 'Use Root Folder Mode' box." -Font $bodyFont
+    & $AppendText -Text "     2. Click 'Browse...' to select the main folder (root) for your website." -Font $bodyFont
+    & $AppendText -Text "     3. Specify the 'Default File Name' (e.g., index.html) to be served for root requests ('/')." -Font $bodyFont
+    & $AppendText -Text "     4. Set your Port and IP, then click 'Start Server'." -Font $bodyFont
+    & $AppendText -Text "" -Font $bodyFont
+
+    # Section 2: Server Configurations
+    & $AppendText -Text "2. Server Configurations" -Font $headingFont -Color $headingColor
+    & $AppendText -Text "The panel on the left allows you to save and manage multiple server configurations." -Font $bodyFont
+    & $AppendText -Text "   - Add a Server: Go to File > New Server Configuration." -Font $bodyFont
+    & $AppendText -Text "   - Switch Servers: Simply click on a server name in the list to load its configuration." -Font $bodyFont
+    & $AppendText -Text "   - Rename/Duplicate: Right-click a server in the list to access options." -Font $bodyFont
+    & $AppendText -Text "" -Font $bodyFont
+
+    # Section 3: Main Controls
+    & $AppendText -Text "3. Main Controls" -Font $headingFont -Color $headingColor
+    & $AppendText -Text "   - Auto-Start Server: If checked, this server will start automatically when the application launches." -Font $bodyFont
+    & $AppendText -Text "   - Use Root Folder Mode: Toggles between Single File and Root Folder modes." -Font $bodyFont
+    & $AppendText -Text "   - Port: The network port the server will listen on. It auto-increments if the port is busy." -Font $bodyFont
+    & $AppendText -Text "   - IP Address to Bind: The network interface to use. '127.0.0.1' is for local access only." -Font $bodyFont
+    & $AppendText -Text "   - Start/Stop Server: Controls the currently selected server." -Font $bodyFont
+    & $AppendText -Text "   - Open in Browser: Opens the server's URL in your default web browser." -Font $bodyFont
+    & $AppendText -Text "   - Log Window: Displays live server activity, requests, and errors." -Font $bodyFont
+    & $AppendText -Text "" -Font $bodyFont
+
+    # Section 4: Settings
+    & $AppendText -Text "4. Settings" -Font $headingFont -Color $headingColor
+    & $AppendText -Text "Access via File > Settings..." -Font $bodyFont
+    & $AppendText -Text "Here you can configure default values for new servers and control application behavior." -Font $bodyFont
+
+    $HelpForm.Controls.Add($HelpTextBox)
+
+    $HelpForm.ShowDialog() | Out-Null
+    $HelpForm.Dispose()
+}
+
 # ==============================================================================
 # 5. Form and Control Setup
 # ==============================================================================
 
 # Load configs and initialize icon before creating form
+Load-Settings
 Load-ServerConfigs
 $AppIcon = Get-AppIcon
 
@@ -482,19 +829,31 @@ $Form.Icon = $AppIcon
 
 # --- Menu Strip (Top) ---
 $MenuStrip = [System.Windows.Forms.MenuStrip]::new()
-$Form.Controls.Add($MenuStrip)
+$MenuStrip.BackColor = [System.Drawing.Color]::FromArgb(255, 220, 220, 220) # Light Gray
 
 # File Menu
 $FileMenuItem = [System.Windows.Forms.ToolStripMenuItem]::new("File")
 $NewMenuItem = [System.Windows.Forms.ToolStripMenuItem]::new("New Server Configuration")
 $SettingsMenuItem = [System.Windows.Forms.ToolStripMenuItem]::new("Settings...")
 $ExitMenuItem = [System.Windows.Forms.ToolStripMenuItem]::new("Exit")
+
 $FileMenuItem.DropDownItems.Add($NewMenuItem) | Out-Null
 $FileMenuItem.DropDownItems.Add("-") | Out-Null
 $FileMenuItem.DropDownItems.Add($SettingsMenuItem) | Out-Null
+$SettingsMenuItem.Add_Click({ Show-SettingsWindow })
 $FileMenuItem.DropDownItems.Add("-") | Out-Null
 $FileMenuItem.DropDownItems.Add($ExitMenuItem) | Out-Null
 $MenuStrip.Items.Add($FileMenuItem) | Out-Null
+
+# Help Menu
+$HelpMenuItem = [System.Windows.Forms.ToolStripMenuItem]::new("Help")
+$ViewHelpMenuItem = [System.Windows.Forms.ToolStripMenuItem]::new("View Help Guide")
+$ViewHelpMenuItem.Add_Click({ Show-HelpGuideWindow })
+$HelpMenuItem.DropDownItems.Add($ViewHelpMenuItem) | Out-Null
+$MenuStrip.Items.Add($HelpMenuItem) | Out-Null
+
+
+$Form.Controls.Add($MenuStrip)
 
 # --- Sidebar Panel (Left) ---
 $SidebarPanel = [System.Windows.Forms.Panel]::new()
@@ -535,6 +894,42 @@ if ($SidebarList.Items.Count -gt 0) {
     $SidebarList.SelectedIndex = 0
 }
 
+# --- Context Menu for Sidebar ---
+$SidebarContextMenu = [System.Windows.Forms.ContextMenuStrip]::new()
+
+$DuplicateMenuItem = [System.Windows.Forms.ToolStripMenuItem]::new("Duplicate Configuration")
+$RenameMenuItem = [System.Windows.Forms.ToolStripMenuItem]::new("Rename Configuration")
+$StartServerMenuItem = [System.Windows.Forms.ToolStripMenuItem]::new("Start Server")
+$StopServerMenuItem = [System.Windows.Forms.ToolStripMenuItem]::new("Stop Server")
+
+$SidebarContextMenu.Items.Add($DuplicateMenuItem) | Out-Null
+$SidebarContextMenu.Items.Add($RenameMenuItem) | Out-Null
+$SidebarContextMenu.Items.Add("-") | Out-Null # Separator
+$SidebarContextMenu.Items.Add($StartServerMenuItem) | Out-Null
+$SidebarContextMenu.Items.Add($StopServerMenuItem) | Out-Null
+
+$SidebarList.ContextMenuStrip = $SidebarContextMenu
+
+# Tooltip for sidebar items
+$SidebarToolTip = [System.Windows.Forms.ToolTip]::new()
+$SidebarToolTip.InitialDelay = 500
+$SidebarToolTip.ReshowDelay = 500
+$SidebarToolTip.AutoPopDelay = 5000
+
+$SidebarList.Add_MouseMove({
+    param($sender, $e)
+    $index = $sender.IndexFromPoint($e.Location)
+    if ($index -ge 0 -and $index -lt $Script:ServerConfigs.Count) {
+        $config = $Script:ServerConfigs[$index]
+        $tooltipText = "URL: http://$($config.IP):$($config.Port)/`nRoot: $($config.Root)"
+        if ($SidebarToolTip.GetToolTip($sender) -ne $tooltipText) {
+            $SidebarToolTip.SetToolTip($sender, $tooltipText)
+        }
+    } else {
+        $SidebarToolTip.SetToolTip($sender, "")
+    }
+})
+
 # --- Main Content Panel (Right) ---
 $ContentPanel = [System.Windows.Forms.Panel]::new()
 $ContentPanel.Location = [System.Drawing.Point]::new($SidebarWidth, $MenuStrip.Height)
@@ -556,11 +951,29 @@ $HeaderLabel.Font = [System.Drawing.Font]::new("Segoe UI", 16, [System.Drawing.F
 $HeaderLabel.ForeColor = [System.Drawing.Color]::White
 $HeaderLabel.AutoSize = $true
 $HeaderLabel.Location = [System.Drawing.Point]::new(20, 20)
-$HeaderLabel.BackColor = [System.Drawing.Color]::FromArgb(255, 75, 0, 130) # Dark Violet / Indigo
+$HeaderLabel.BackColor = [System.Drawing.Color]::Transparent
 $HeaderPanel.Controls.Add($HeaderLabel)
 
-# --- Server Root Folder Controls ---
-$yPos = 80 + $padding
+# --- Auto-Start Checkbox ---
+$yPos = 80
+$AutoStartCheckBox = [System.Windows.Forms.CheckBox]::new()
+$AutoStartCheckBox.Text = "Auto-Start This Server on Launch"
+$AutoStartCheckBox.AutoSize = $true
+$AutoStartCheckBox.Font = [System.Drawing.Font]::new("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$AutoStartCheckBox.Location = [System.Drawing.Point]::new([int]$xStart, $yPos)
+$ContentPanel.Controls.Add($AutoStartCheckBox)
+$yPos += 30
+
+# --- Mode Selection Checkbox ---
+$RootModeCheckBox = [System.Windows.Forms.CheckBox]::new()
+$RootModeCheckBox.Text = "Use Root Folder Mode"
+$RootModeCheckBox.AutoSize = $true
+$RootModeCheckBox.Font = [System.Drawing.Font]::new("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$RootModeCheckBox.Location = [System.Drawing.Point]::new([int]$xStart, $yPos)
+$ContentPanel.Controls.Add($RootModeCheckBox)
+$yPos += 35 # Increased spacing
+
+# --- Server Root Folder Controls (Root Mode) ---
 $RootLabel = [System.Windows.Forms.Label]::new()
 $RootLabel.Text = "Server Root Folder:"
 $RootLabel.Font = [System.Drawing.Font]::new("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
@@ -578,10 +991,33 @@ $BrowseButton.Text = "Browse..."
 $BrowseButton.Width = 100
 $BrowseButton.Height = 25
 $BrowseButton.Location = [System.Drawing.Point]::new(([int]$xStart + 330), ($yPos + 25))
+$BrowseButton.FlatStyle = [System.Windows.Forms.FlatStyle]::System
 $ContentPanel.Controls.Add($BrowseButton)
 
+# --- Single HTML File Controls (Single File Mode) ---
+$SingleFileLabel = [System.Windows.Forms.Label]::new()
+$SingleFileLabel.Text = "Single HTML File to Serve:"
+$SingleFileLabel.Font = [System.Drawing.Font]::new("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$SingleFileLabel.AutoSize = $true
+$SingleFileLabel.Location = [System.Drawing.Point]::new([int]$xStart, $yPos)
+$ContentPanel.Controls.Add($SingleFileLabel)
+
+$SingleFileTextBox = [System.Windows.Forms.TextBox]::new()
+$SingleFileTextBox.Width = 320
+$SingleFileTextBox.Location = [System.Drawing.Point]::new([int]$xStart, ($yPos + 25))
+$ContentPanel.Controls.Add($SingleFileTextBox)
+
+$SingleFileBrowseButton = [System.Windows.Forms.Button]::new()
+$SingleFileBrowseButton.Text = "Browse..."
+$SingleFileBrowseButton.Width = 100
+$SingleFileBrowseButton.Height = 25
+$SingleFileBrowseButton.Location = [System.Drawing.Point]::new(([int]$xStart + 330), ($yPos + 25))
+$SingleFileBrowseButton.FlatStyle = [System.Windows.Forms.FlatStyle]::System
+$ContentPanel.Controls.Add($SingleFileBrowseButton)
+
+
 # --- Default File Name Controls ---
-$yPos += 70
+$yPos += 60 # Corrected Y position
 $DefaultFileLabel = [System.Windows.Forms.Label]::new()
 $DefaultFileLabel.Text = "Default File Name (e.g., index.html):"
 $DefaultFileLabel.Font = [System.Drawing.Font]::new("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
@@ -600,17 +1036,17 @@ $PortLabel = [System.Windows.Forms.Label]::new()
 $PortLabel.Text = "Server Port:"
 $PortLabel.Font = [System.Drawing.Font]::new("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
 $PortLabel.AutoSize = $true
-$PortLabel.Location = [System.Drawing.Point]::new(([int]$xStart + 300), $yPos)
+$PortLabel.Location = [System.Drawing.Point]::new(([int]$xStart + 280), $yPos) # Adjusted X
 $ContentPanel.Controls.Add($PortLabel)
 
 $PortTextBox = [System.Windows.Forms.TextBox]::new()
 $PortTextBox.Text = "8080"
 $PortTextBox.Width = 80
-$PortTextBox.Location = [System.Drawing.Point]::new(([int]$xStart + 300), ($yPos + 25))
+$PortTextBox.Location = [System.Drawing.Point]::new(([int]$xStart + 280), ($yPos + 25)) # Adjusted X
 $ContentPanel.Controls.Add($PortTextBox)
 
 # --- IP Address Selection ---
-$yPos += 70
+$yPos += 60 # Corrected Y position
 $IPLabel = [System.Windows.Forms.Label]::new()
 $IPLabel.Text = "IP Address to Bind:"
 $IPLabel.Font = [System.Drawing.Font]::new("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
@@ -628,60 +1064,37 @@ $ContentPanel.Controls.Add($IPComboBox)
 
 
 # --- Action Buttons with Colored Border Panels ---
-$yPos += 70
+$yPos += 70 # Corrected Y position
 
-# 1. Start Button Panel (Green Border)
-$StartButtonPanel = [System.Windows.Forms.Panel]::new()
-$StartButtonPanel.Width = $ButtonWidth + 2 * $BorderThickness
-$StartButtonPanel.Height = $ButtonHeight + 2 * $BorderThickness
-$StartButtonPanel.BackColor = [System.Drawing.Color]::FromArgb(255, 50, 180, 50) # Lime Green border
-$StartButtonPanel.Location = [System.Drawing.Point]::new([int]$xStart, $yPos)
-$ContentPanel.Controls.Add($StartButtonPanel)
-
+# 1. Start Button
 $StartButton = [System.Windows.Forms.Button]::new()
 $StartButton.Text = "Start Server"
 $StartButton.Width = $ButtonWidth
 $StartButton.Height = $ButtonHeight
 $StartButton.Font = [System.Drawing.Font]::new("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-$StartButton.BackColor = [System.Drawing.SystemColors]::Control
-$StartButton.Location = [System.Drawing.Point]::new($BorderThickness, $BorderThickness)
-$StartButtonPanel.Controls.Add($StartButton)
+$StartButton.Location = [System.Drawing.Point]::new([int]$xStart, $yPos)
+$StartButton.FlatStyle = [System.Windows.Forms.FlatStyle]::System
+$ContentPanel.Controls.Add($StartButton)
 
-
-# 2. Stop Button Panel (Red Border)
-$StopButtonPanel = [System.Windows.Forms.Panel]::new()
-$StopButtonPanel.Width = $ButtonWidth + 2 * $BorderThickness
-$StopButtonPanel.Height = $ButtonHeight + 2 * $BorderThickness
-$StopButtonPanel.BackColor = [System.Drawing.Color]::FromArgb(255, 200, 50, 50) # Red border
-$StopButtonPanel.Location = [System.Drawing.Point]::new(([int]$xStart + $ButtonWidth + 20), $yPos)
-$ContentPanel.Controls.Add($StopButtonPanel)
-
+# 2. Stop Button
 $StopButton = [System.Windows.Forms.Button]::new()
 $StopButton.Text = "Stop Server"
 $StopButton.Width = $ButtonWidth
 $StopButton.Height = $ButtonHeight
 $StopButton.Font = [System.Drawing.Font]::new("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-$StopButton.BackColor = [System.Drawing.SystemColors]::Control
-$StopButton.Location = [System.Drawing.Point]::new($BorderThickness, $BorderThickness)
-$StopButtonPanel.Controls.Add($StopButton)
+$StopButton.Location = [System.Drawing.Point]::new(([int]$xStart + $ButtonWidth + 20), $yPos)
+$StopButton.FlatStyle = [System.Windows.Forms.FlatStyle]::System
+$ContentPanel.Controls.Add($StopButton)
 
-
-# 3. Open in Browser Button (Blue Border)
-$OpenBrowserPanel = [System.Windows.Forms.Panel]::new()
-$OpenBrowserPanel.Width = $ButtonWidth + 2 * $BorderThickness
-$OpenBrowserPanel.Height = $ButtonHeight + 2 * $BorderThickness
-$OpenBrowserPanel.BackColor = [System.Drawing.Color]::FromArgb(255, 50, 150, 250) # Blue border
-$OpenBrowserPanel.Location = [System.Drawing.Point]::new(([int]$xStart + 2*($ButtonWidth + 20)), $yPos)
-$ContentPanel.Controls.Add($OpenBrowserPanel)
-
+# 3. Open in Browser Button
 $OpenBrowserButton = [System.Windows.Forms.Button]::new()
 $OpenBrowserButton.Text = "Open in Browser"
 $OpenBrowserButton.Width = $ButtonWidth
 $OpenBrowserButton.Height = $ButtonHeight
 $OpenBrowserButton.Font = [System.Drawing.Font]::new("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-$OpenBrowserButton.BackColor = [System.Drawing.SystemColors]::Control
-$OpenBrowserButton.Location = [System.Drawing.Point]::new($BorderThickness, $BorderThickness)
-$OpenBrowserPanel.Controls.Add($OpenBrowserButton)
+$OpenBrowserButton.Location = [System.Drawing.Point]::new(([int]$xStart + 2*($ButtonWidth + 20)), $yPos)
+$OpenBrowserButton.FlatStyle = [System.Windows.Forms.FlatStyle]::System
+$ContentPanel.Controls.Add($OpenBrowserButton)
 
 
 # --- Status Log (Adjusted for Content Panel) ---
@@ -694,7 +1107,7 @@ $LogTextBox.ReadOnly = $true
 $LogTextBox.BackColor = [System.Drawing.Color]::Black
 $LogTextBox.ForeColor = [System.Drawing.Color]::Lime
 # Y position adjusted relative to ContentPanel
-$LogTextBox.Location = [System.Drawing.Point]::new([int]$xStart, 400 - $MenuStrip.Height)
+$LogTextBox.Location = [System.Drawing.Point]::new([int]$xStart, $yPos + $ButtonHeight + 20) # Position below buttons
 $ContentPanel.Controls.Add($LogTextBox)
 
 
@@ -703,12 +1116,27 @@ $ExitButton = [System.Windows.Forms.Button]::new()
 $ExitButton.Text = "Exit"
 $ExitButton.Width = 60
 $ExitButton.Height = 25
-$ExitButton.Location = [System.Drawing.Point]::new($ContentWidth - 60 - $xStart, 485 - $MenuStrip.Height)
+$ExitButton.Location = [System.Drawing.Point]::new($ContentWidth - 60 - $xStart, $LogTextBox.Location.Y + $LogTextBox.Height + 15) # Position below log box
+$ExitButton.FlatStyle = [System.Windows.Forms.FlatStyle]::System
 $ContentPanel.Controls.Add($ExitButton)
 
 # Tooltip for Exit Button
 $ExitTooltip = [System.Windows.Forms.ToolTip]::new()
 $ExitTooltip.SetToolTip($ExitButton, "Gracefully stop all active servers before closing the window.")
+
+# --- Main Control Tooltips ---
+$MainTooltip = [System.Windows.Forms.ToolTip]::new()
+$MainTooltip.SetToolTip($RootModeCheckBox, "Check this to serve files from a directory. Uncheck to serve a single file.")
+$MainTooltip.SetToolTip($RootTextBox, "The root directory your website files are in (Root Folder Mode).")
+$MainTooltip.SetToolTip($SingleFileTextBox, "The single HTML file to serve for all requests (Single File Mode).")
+$MainTooltip.SetToolTip($DefaultFileTextBox, "The default file to serve for root requests, e.g., 'index.html' (Root Folder Mode).")
+$MainTooltip.SetToolTip($PortTextBox, "The network port the server will listen on (e.g., 8080).")
+$MainTooltip.SetToolTip($IPComboBox, "The IP address the server will bind to. 127.0.0.1 is for local access only.")
+$MainTooltip.SetToolTip($StartButton, "Starts the server with the current configuration.")
+$MainTooltip.SetToolTip($StopButton, "Stops the currently running server.")
+$MainTooltip.SetToolTip($OpenBrowserButton, "Opens the server URL in your default browser.")
+$MainTooltip.SetToolTip($LogTextBox, "Displays live server activity, requests, and errors.")
+$MainTooltip.SetToolTip($AutoStartCheckBox, "If checked, this server will attempt to start automatically when the application launches.")
 
 
 # --- Status Bar ---
@@ -750,8 +1178,14 @@ $StartButton.Add_Click({
     }
     
     # Check for root path existence
-    if (-not (Test-Path $currentConfig.Root -PathType Container)) {
+    if ($currentConfig.UseRootFolderMode -and -not (Test-Path $currentConfig.Root -PathType Container)) {
         Write-Log "ERROR: Server Root Path not found: $($currentConfig.Root)"
+        return
+    }
+
+    # Check for single file existence
+    if (-not $currentConfig.UseRootFolderMode -and -not (Test-Path $currentConfig.SingleFilePath -PathType Leaf)) {
+        Write-Log "ERROR: Single HTML file not found: $($currentConfig.SingleFilePath)"
         return
     }
 
@@ -771,6 +1205,21 @@ $BrowseButton.Add_Click({
         Update-ConfigFromGUI
         Write-Log "Root folder set to: $($RootTextBox.Text)"
     }
+})
+
+$SingleFileBrowseButton.Add_Click({
+    $FileBrowser = [System.Windows.Forms.OpenFileDialog]::new()
+    $FileBrowser.Filter = "HTML Files (*.html, *.htm)|*.html;*.htm|All files (*.*)|*.*"
+    if ($FileBrowser.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $SingleFileTextBox.Text = $FileBrowser.FileName
+        Update-ConfigFromGUI
+        Write-Log "Single file set to: $($SingleFileTextBox.Text)"
+    }
+})
+
+$RootModeCheckBox.Add_CheckedChanged({
+    Update-ConfigFromGUI
+    Update-GUIFromConfig
 })
 
 $OpenBrowserButton.Add_Click({
@@ -799,19 +1248,106 @@ $ExitMenuItem.Add_Click({
     $Form.Close() # This triggers FormClosing event
 })
 
-# IMPORTANT: Override default FormClosing behavior to add the custom message
+# IMPORTANT: A SINGLE FormClosing handler for orderly shutdown
 $Form.Add_FormClosing({
     param($sender, $e)
+
     # Prevent the form from closing immediately while we show the goodbye message
     if (-not $Script:IsExiting) {
-        $e.Cancel = $true
-        # Execute the graceful shutdown and popup sequence
-        Show-GoodbyeWindow "Goodbye see you soon!"
+        $e.Cancel = $true # Always cancel the first close event to allow for graceful shutdown
+
+        # 1. Signal all background threads to stop
+        $Script:IsExiting = $true
+
+        # 2. Stop all running servers gracefully
+        $Script:ServerConfigs | Where-Object { $_.Status -eq "Running" } | ForEach-Object {
+            Stop-Server $_
+        }
+
+        # 3. Stop the log timer
+        if ($Script:LogTimer -and $Script:LogTimer.Enabled) {
+            $Script:LogTimer.Stop()
+        }
+
+        # 4. Show goodbye window or close immediately
+        if ($Script:Settings.ShowGoodbyeWindow) {
+            Show-GoodbyeWindow "Goodbye see you soon!"
+        } else {
+            # This will re-trigger FormClosing, but $Script:IsExiting is now true, so it will fall through
+            $Form.Close()
+        }
+    }
+    # On the second pass (triggered by Show-GoodbyeWindow or immediate close), $Script:IsExiting is true, and the form closes without canceling.
+})
+
+$DuplicateMenuItem.Add_Click({
+    if ($SidebarList.SelectedIndex -ge 0) {
+        $originalConfig = $Script:ServerConfigs[$SidebarList.SelectedIndex]
+        $newConfig = $originalConfig | Select-Object * # Easiest way to clone a PSCustomObject
+        $newConfig.Name = "$($originalConfig.Name) (Copy)"
+        $newConfig.Port = $originalConfig.Port + 1 # Suggest a new port
+        $newConfig.Status = "Stopped"
+        
+        $Script:ServerConfigs += $newConfig
+        $SidebarList.Items.Add($newConfig.Name) | Out-Null
+        Save-ServerConfig
+        Write-Log "Duplicated configuration: $($newConfig.Name)"
+    }
+})
+
+$RenameMenuItem.Add_Click({
+    if ($SidebarList.SelectedIndex -ge 0) {
+        $currentConfig = $Script:ServerConfigs[$SidebarList.SelectedIndex]
+        $inputBox = [Microsoft.VisualBasic.Interaction]::InputBox("Enter new name for configuration:", "Rename Configuration", $currentConfig.Name)
+        if (-not [string]::IsNullOrEmpty($inputBox)) {
+            $currentConfig.Name = $inputBox
+            $SidebarList.Items[$SidebarList.SelectedIndex] = $inputBox
+            Save-ServerConfig
+            Update-GUIFromConfig # Update header if current config is renamed
+            Write-Log "Renamed configuration to: $($inputBox)"
+        }
+    }
+})
+
+$StartServerMenuItem.Add_Click({
+    if ($SidebarList.SelectedIndex -ge 0) {
+        $currentConfig = $Script:ServerConfigs[$SidebarList.SelectedIndex]
+        if ($currentConfig.Status -ne "Running") {
+            Start-Server $currentConfig
+        } else {
+            Write-Log "Server '$($currentConfig.Name)' is already running."
+        }
+    }
+})
+
+$StopServerMenuItem.Add_Click({
+    if ($SidebarList.SelectedIndex -ge 0) {
+        $currentConfig = $Script:ServerConfigs[$SidebarList.SelectedIndex]
+        if ($currentConfig.Status -eq "Running") {
+            Stop-Server $currentConfig
+        } else {
+            Write-Log "Server '$($currentConfig.Name)' is not running."
+        }
     }
 })
 
 # --- Final Initialization ---
-Update-GUIFromConfig
+# This handler runs when the form is fully loaded and the handle is created
+$Form.Add_Shown({
+    # 1. Update the GUI with the initially selected config
+    Update-GUIFromConfig
+
+    # 2. Auto-start servers that are configured to do so
+    $autoStartConfigs = $Script:ServerConfigs | Where-Object { $_.AutoStart -eq $true }
+    if ($autoStartConfigs) {
+        Write-Log "Found $($autoStartConfigs.Count) server(s) configured for auto-start..."
+        foreach ($config in $autoStartConfigs) {
+            Write-Log "Auto-starting server: $($config.Name)"
+            Start-Server $config
+        }
+    }
+})
+
 Start-LogTimer
 Write-Log "EliteSoftware HTTP Test Server v$ScriptVersion Initialized."
 
