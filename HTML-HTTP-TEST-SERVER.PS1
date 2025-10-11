@@ -1,10 +1,10 @@
-# EliteSoftware HTML - HTTP Test Server v1.4.2.0 - Created by: Zachary Whiteman & Google Gemini Ai. 2025-10-11 - 03:30 EDT
+# EliteSoftware HTML - HTTP Test Server v1.4.3.0 - Created by: Zachary Whiteman & Google Gemini Ai. 2025-10-11 - 03:45 EDT
 
 <#
     This script implements a multi-server HTTP test platform GUI using PowerShell WinForms and threading.
 
-    FIXES IN V1.4.2.0:
-    - **Fixed Instant Crash:** Corrected a critical syntax error in the "Duplicate Configuration" logic that caused the application to crash immediately on launch.
+    FIXES IN V1.4.3.0:
+    - **Fixed Configuration Save Errors:** Resolved the recurring `SetValueInvocationException` by ensuring that all configuration objects loaded from JSON are converted into fully modifiable `[PSCustomObject]` types. This guarantees that properties can be updated and saved without error.
 #>
 
 # ==============================================================================
@@ -12,7 +12,7 @@
 # ==============================================================================
 
 # Script Versioning
-[string]$ScriptVersion = "v1.4.2.0"
+[string]$ScriptVersion = "v1.4.3.0"
 
 # Load required .NET assemblies
 # The 'Add-Type' for Drawing2D often generates a benign file-not-found error in some editors,
@@ -163,22 +163,22 @@ function Load-ServerConfigs {
         )
     }
 
-    # Ensure all configs have the required properties
-    $Script:ServerConfigs = $Script:ServerConfigs | ForEach-Object {
-        if (-not $_.PSObject.Properties.Match('Status')) {
-            $_ | Add-Member -MemberType NoteProperty -Name Status -Value "Stopped" -Force
+    # Ensure all configs have the required properties and are of the correct type
+    $reconstructedConfigs = @()
+    foreach ($config in $Script:ServerConfigs) {
+        $reconstructedConfigs += [PSCustomObject]@{
+            Name = $config.Name
+            Root = $config.Root
+            DefaultFile = $config.DefaultFile
+            Port = $config.Port
+            IP = $config.IP
+            Status = if ($config.PSObject.Properties.Match('Status')) { $config.Status } else { "Stopped" }
+            UseRootFolderMode = if ($config.PSObject.Properties.Match('UseRootFolderMode')) { $config.UseRootFolderMode } else { $false }
+            SingleFilePath = if ($config.PSObject.Properties.Match('SingleFilePath')) { $config.SingleFilePath } else { "" }
+            AutoStart = if ($config.PSObject.Properties.Match('AutoStart')) { $config.AutoStart } else { $false }
         }
-        if (-not $_.PSObject.Properties.Match('UseRootFolderMode')) {
-            $_ | Add-Member -MemberType NoteProperty -Name UseRootFolderMode -Value $false -Force
-        }
-        if (-not $_.PSObject.Properties.Match('SingleFilePath')) {
-            $_ | Add-Member -MemberType NoteProperty -Name SingleFilePath -Value "" -Force
-        }
-        if (-not $_.PSObject.Properties.Match('AutoStart')) {
-            $_ | Add-Member -MemberType NoteProperty -Name AutoStart -Value $false -Force
-        }
-        $_
     }
+    $Script:ServerConfigs = $reconstructedConfigs
 }
 
 function Add-NewConfig {
@@ -244,11 +244,6 @@ function Update-GUIFromConfig {
 function Update-ConfigFromGUI {
     if ($Script:ServerConfigs.Count -gt $Script:CurrentConfigIndex) {
         $config = $Script:ServerConfigs[$Script:CurrentConfigIndex]
-        # Ensure the object is a modifiable PSCustomObject
-        if ($config -isnot [System.Management.Automation.PSCustomObject]) {
-            $config = $config | Select-Object *
-            $Script:ServerConfigs[$Script:CurrentConfigIndex] = $config
-        }
         $config.Root = $RootTextBox.Text
         $config.DefaultFile = $DefaultFileTextBox.Text
         $config.Port = [int]$PortTextBox.Text
@@ -714,19 +709,24 @@ function Show-SettingsWindow {
 function Show-HelpGuideWindow {
     $HelpForm = [System.Windows.Forms.Form]::new()
     $HelpForm.Text = "Help Guide"
-    $HelpForm.Size = [System.Drawing.Size]::new(650, 550)
+    $HelpForm.Size = [System.Drawing.Size]::new(700, 600) # Made window larger
     $HelpForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
     $HelpForm.MinimizeBox = $false
     $HelpForm.MaximizeBox = $false
     $HelpForm.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
     $HelpForm.BackColor = [System.Drawing.Color]::White
+    $HelpForm.Icon = $AppIcon # Added application icon
 
     $HelpTextBox = [System.Windows.Forms.RichTextBox]::new()
-    $HelpTextBox.Dock = [System.Windows.Forms.DockStyle]::Fill
     $HelpTextBox.ReadOnly = $true
     $HelpTextBox.BorderStyle = [System.Windows.Forms.BorderStyle]::None
-    $HelpTextBox.Margin = [System.Windows.Forms.Padding]::new(15) # Add padding around the text
     $HelpTextBox.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Vertical
+
+    # Set location and size to create padding, and anchor it to all sides
+    $padding = 15
+    $HelpTextBox.Location = [System.Drawing.Point]::new($padding, $padding)
+    $HelpTextBox.Size = [System.Drawing.Size]::new($HelpForm.ClientSize.Width - (2 * $padding), $HelpForm.ClientSize.Height - (2 * $padding))
+    $HelpTextBox.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 
     # --- Define Fonts ---
     $titleFont = [System.Drawing.Font]::new("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
